@@ -2,6 +2,8 @@
 name = "gigabytectl"
 version = "0.1.0"
 edition = "2024"
+description = "A Simple Rust-Based TUI app for the gigabyte-laptop-wmi kernel module"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.102"
