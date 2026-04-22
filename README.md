@@ -6,7 +6,7 @@ A simple Rust-based TUI app for controlling laptops using the `gigabyte-laptop-w
 
 ## 📦 Installation
 
-### Method 1: Using Cargo (not recommended)
+### Method 1: Using Cargo
 
 ```bash
 cargo install gigabytectl
