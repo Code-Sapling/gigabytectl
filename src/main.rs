@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::Path,
     time::{Duration, Instant},
+    process::Command
 };
 
 use anyhow::{Context, Result};
@@ -263,6 +264,18 @@ fn battery_cycle_text(v: Option<String>) -> String {
 fn is_root() -> bool {
     // Uses standard library Unix extensions to check the UID of the current process safely
     fs::metadata("/proc/self").map(|m| m.uid() == 0).unwrap_or(false)
+}
+
+fn run_sudo() {
+    let exe = std::env::current_exe().expect("failed to get current exe");
+
+    let status = Command::new("sudo")
+        .arg(exe)
+        .args(std::env::args().skip(1))
+        .status()
+        .expect("failed to execute sudo");
+
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn driver_present() -> bool {
@@ -573,9 +586,9 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) {
 fn main() -> Result<()> {
     // 1. Initial Root Check
     if !is_root() {
-        eprintln!("please run the app as root");
-        std::process::exit(1);
+        run_sudo();
     }
+
 
     if !driver_present() {
         eprintln!("{} does not exist. Please install gigabyte-laptop-wmi and ensure it is running.", ROOT);
