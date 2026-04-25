@@ -586,7 +586,21 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) {
 fn main() -> Result<()> {
     // 1. Initial Root Check
     if !is_root() {
-        run_sudo();
+        println!("This program requires root privileges.");
+        print!("Do you want to run with sudo? [y/n]: ");
+
+        use std::io::{self, Write};
+        io::stdout().flush().ok();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).ok();
+
+        if input.trim().eq_ignore_ascii_case("y") {
+            run_sudo();
+        } else {
+            println!("Exiting.");
+            std::process::exit(1);
+        }
     }
 
 
