@@ -1,9 +1,10 @@
 [package]
 name = "gigabytectl"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "A Simple Rust-Based TUI app for the gigabyte-laptop-wmi kernel module"
+description = "A simple Rust-based TUI tool for controlling laptops using the gigabyte-laptop-wmi kernel module."
 license = "MIT"
+repository = "https://github.com/Code-Sapling/gigabytectl"
 
 [dependencies]
 anyhow = "1.0.102"
