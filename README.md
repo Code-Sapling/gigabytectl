@@ -1,6 +1,6 @@
 # gigabytectl
 
-A simple Rust-based TUI app for controlling laptops using the `gigabyte-laptop-wmi` kernel module.
+A simple Rust-based TUI tool for controlling laptops using the `gigabyte-laptop-wmi` kernel module.
 
 ---
 

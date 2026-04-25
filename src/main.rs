@@ -31,6 +31,8 @@ const CHARGE_MODE: &str = "/sys/devices/platform/aorus_laptop/charge_mode";
 const CHARGE_LIMIT: &str = "/sys/devices/platform/aorus_laptop/charge_limit";
 const GPU_BOOST: &str = "/sys/devices/platform/aorus_laptop/gpu_boost";
 const BATTERY_CYCLE: &str = "/sys/devices/platform/aorus_laptop/battery_cycle";
+const FAN_CURVE_INDEX: &str = "/sys/devices/platform/aorus_laptop/fan_curve_index";
+const FAN_CURVE_DATA: &str = "/sys/devices/platform/aorus_laptop/fan_curve_data";
 
 const FAN_MODES: [&str; 6] = ["Normal", "Silent", "Gaming", "Custom", "Auto", "Fixed"];
 
@@ -41,6 +43,7 @@ enum Item {
     ChargeMode,
     ChargeLimit,
     GpuBoost,
+    FanCurveEditor,
     Refresh,
     Quit,
 }
@@ -49,12 +52,15 @@ enum Item {
 enum EditTarget {
     FanCustomSpeed,
     ChargeLimit,
+    FanCurveTemp(usize),
+    FanCurveSpeed(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Normal,
     Editing,
+    FanCurveList,
 }
 
 struct App {
@@ -71,6 +77,11 @@ struct App {
     charge_limit: Option<i32>,
     gpu_boost: Option<i32>,
     battery_cycle: Option<String>,
+    
+    fan_curve: Option<Vec<(i32, i32)>>,
+    fan_curve_selected: usize,
+    fan_curve_col: usize, // 0 = Temp, 1 = Speed
+
     last_refresh: Instant,
 }
 
@@ -83,6 +94,7 @@ impl App {
                 Item::ChargeMode,
                 Item::ChargeLimit,
                 Item::GpuBoost,
+                Item::FanCurveEditor,
                 Item::Refresh,
                 Item::Quit,
             ],
@@ -97,6 +109,9 @@ impl App {
             charge_limit: None,
             gpu_boost: None,
             battery_cycle: None,
+            fan_curve: None,
+            fan_curve_selected: 0,
+            fan_curve_col: 0,
             last_refresh: Instant::now(),
         }
     }
@@ -108,6 +123,7 @@ impl App {
         self.charge_limit = read_i32(CHARGE_LIMIT);
         self.gpu_boost = read_i32(GPU_BOOST);
         self.battery_cycle = read_trimmed(BATTERY_CYCLE);
+        self.fan_curve = read_fan_curve();
         self.last_refresh = Instant::now();
     }
 
@@ -131,7 +147,11 @@ impl App {
     }
 
     fn cancel_edit(&mut self) {
-        self.focus = Focus::Normal;
+        if let Some(EditTarget::FanCurveTemp(_)) | Some(EditTarget::FanCurveSpeed(_)) = self.editing {
+            self.focus = Focus::FanCurveList;
+        } else {
+            self.focus = Focus::Normal;
+        }
         self.editing = None;
         self.input.clear();
     }
@@ -169,6 +189,24 @@ impl App {
                     write_value(CHARGE_LIMIT, value)
                 } else {
                     Err(anyhow::anyhow!("Charge limit must be 60..100"))
+                }
+            }
+            EditTarget::FanCurveTemp(idx) => {
+                if (0..=100).contains(&value) {
+                    if let Some(curve) = &self.fan_curve {
+                        write_fan_curve_point(idx, value, curve[idx].1)
+                    } else { Err(anyhow::anyhow!("Curve not loaded")) }
+                } else {
+                    Err(anyhow::anyhow!("Temperature must be 0..100"))
+                }
+            }
+            EditTarget::FanCurveSpeed(idx) => {
+                if (0..=255).contains(&value) {
+                    if let Some(curve) = &self.fan_curve {
+                        write_fan_curve_point(idx, curve[idx].0, value)
+                    } else { Err(anyhow::anyhow!("Curve not loaded")) }
+                } else {
+                    Err(anyhow::anyhow!("Speed must be 0..255"))
                 }
             }
         };
@@ -225,6 +263,32 @@ fn write_value(path: &str, value: i32) -> Result<()> {
     Ok(())
 }
 
+fn read_fan_curve() -> Option<Vec<(i32, i32)>> {
+    let mut curve = Vec::new();
+    for i in 0..15 {
+        if write_value(FAN_CURVE_INDEX, i).is_err() {
+            return None;
+        }
+        let data = read_trimmed(FAN_CURVE_DATA)?;
+        let parts: Vec<&str> = data.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let temp = parts[0].parse::<i32>().ok()?;
+            let speed = parts[1].parse::<i32>().ok()?;
+            curve.push((temp, speed));
+        } else {
+            return None;
+        }
+    }
+    Some(curve)
+}
+
+fn write_fan_curve_point(index: usize, temp: i32, speed: i32) -> Result<()> {
+    write_value(FAN_CURVE_INDEX, index as i32)?;
+    let data = (speed * 256) + temp;
+    write_value(FAN_CURVE_DATA, data)?;
+    Ok(())
+}
+
 fn fan_mode_name(v: Option<i32>) -> String {
     match v {
         Some(i) if (0..=5).contains(&i) => FAN_MODES[i as usize].to_string(),
@@ -262,7 +326,6 @@ fn battery_cycle_text(v: Option<String>) -> String {
 }
 
 fn is_root() -> bool {
-    // Uses standard library Unix extensions to check the UID of the current process safely
     fs::metadata("/proc/self").map(|m| m.uid() == 0).unwrap_or(false)
 }
 
@@ -309,6 +372,7 @@ fn item_title(item: Item) -> &'static str {
         Item::ChargeMode => "Charging mode",
         Item::ChargeLimit => "Charging limit",
         Item::GpuBoost => "GPU boost",
+        Item::FanCurveEditor => "Fan curve editor",
         Item::Refresh => "Refresh values",
         Item::Quit => "Quit",
     }
@@ -321,6 +385,7 @@ fn item_hint(item: Item) -> &'static str {
         Item::ChargeMode => "Left/Right toggles Normal/Custom",
         Item::ChargeLimit => "Enter 60..100",
         Item::GpuBoost => "Left/Right toggles ON/OFF",
+        Item::FanCurveEditor => "Press Enter to open the fan curve editor",
         Item::Refresh => "Reload all sysfs nodes",
         Item::Quit => "Exit the app",
     }
@@ -408,9 +473,11 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let status_text = if app.focus == Focus::Editing {
         let label = match app.editing {
-            Some(EditTarget::FanCustomSpeed) => "Enter fan custom speed",
-            Some(EditTarget::ChargeLimit) => "Enter charge limit",
-            None => "Editing",
+            Some(EditTarget::FanCustomSpeed) => "Enter fan custom speed".to_string(),
+            Some(EditTarget::ChargeLimit) => "Enter charge limit".to_string(),
+            Some(EditTarget::FanCurveTemp(idx)) => format!("Enter temp for idx {}", idx),
+            Some(EditTarget::FanCurveSpeed(idx)) => format!("Enter speed for idx {}", idx),
+            None => "Editing".to_string(),
         };
         format!("{}: {}", label, app.input)
     } else {
@@ -426,57 +493,104 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(7), Constraint::Length(4)])
+        .constraints([Constraint::Min(12), Constraint::Length(5)])
         .split(main[1]);
 
-    let fan_mode_text = fan_mode_name(app.fan_mode);
-    let gpu_text = gpu_boost_name(app.gpu_boost);
-    let charge_text = charge_mode_name(app.charge_mode);
-
-    let dashboard = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Fan mode       ", Style::default().fg(Color::White)),
-            Span::styled(fan_mode_text.clone(), badge_style(&fan_mode_text)),
-        ]),
-        Line::from(vec![
-            Span::styled("Fan speed      ", Style::default().fg(Color::White)),
-            Span::styled(value_or_na(app.fan_custom_speed), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("Charge mode    ", Style::default().fg(Color::White)),
-            Span::styled(charge_text, badge_style(charge_text)),
-        ]),
-        Line::from(vec![
-            Span::styled("Charge limit   ", Style::default().fg(Color::White)),
-            Span::styled(value_or_na(app.charge_limit), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("GPU boost      ", Style::default().fg(Color::White)),
-            Span::styled(gpu_text, badge_style(gpu_text)),
-        ]),
-        Line::from(vec![
-            Span::styled("Battery cycle  ", Style::default().fg(Color::White)),
-            Span::styled(battery_cycle_text(app.battery_cycle.clone()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Current values"))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(dashboard, right[0]);
-
     let selected = app.selected_item();
-    let help = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Selected: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(item_title(selected), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("Hint: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(item_hint(selected)),
-        ]),
-        Line::from("↑/↓ move   ←/→ action   Enter edit/apply   Esc cancel   r refresh   q quit"),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Help"))
-    .wrap(Wrap { trim: true });
+
+    if app.focus == Focus::FanCurveList || selected == Item::FanCurveEditor {
+        let mut lines = vec![];
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>3}  ", "Idx"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:>9}", "Temp (°C)"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::styled(format!("{:>13}", "Speed (0-255)"), Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+
+        if let Some(curve) = &app.fan_curve {
+            for (i, &(temp, speed)) in curve.iter().enumerate() {
+                let is_selected_row = app.focus == Focus::FanCurveList && app.fan_curve_selected == i;
+                let t_style = if is_selected_row && app.fan_curve_col == 0 { item_style(true) } else { Style::default() };
+                let s_style = if is_selected_row && app.fan_curve_col == 1 { item_style(true) } else { Style::default() };
+
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{:>3}  ", i)),
+                    Span::styled(format!("{:>9}", temp), t_style),
+                    Span::raw("   "),
+                    Span::styled(format!("{:>13}", speed), s_style),
+                ]));
+            }
+        } else {
+            lines.push(Line::from("Failed to read fan curve data."));
+        }
+
+        let fc_widget = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Fan Curve"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(fc_widget, right[0]);
+    } else {
+        let fan_mode_text = fan_mode_name(app.fan_mode);
+        let gpu_text = gpu_boost_name(app.gpu_boost);
+        let charge_text = charge_mode_name(app.charge_mode);
+
+        let dashboard = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Fan mode       ", Style::default().fg(Color::White)),
+                Span::styled(fan_mode_text.clone(), badge_style(&fan_mode_text)),
+            ]),
+            Line::from(vec![
+                Span::styled("Fan speed      ", Style::default().fg(Color::White)),
+                Span::styled(value_or_na(app.fan_custom_speed), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("Charge mode    ", Style::default().fg(Color::White)),
+                Span::styled(charge_text, badge_style(charge_text)),
+            ]),
+            Line::from(vec![
+                Span::styled("Charge limit   ", Style::default().fg(Color::White)),
+                Span::styled(value_or_na(app.charge_limit), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("GPU boost      ", Style::default().fg(Color::White)),
+                Span::styled(gpu_text, badge_style(gpu_text)),
+            ]),
+            Line::from(vec![
+                Span::styled("Battery cycle  ", Style::default().fg(Color::White)),
+                Span::styled(battery_cycle_text(app.battery_cycle.clone()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ]),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Current values"))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(dashboard, right[0]);
+    }
+
+    let help_text = match app.focus {
+        Focus::FanCurveList => vec![
+            Line::from(vec![
+                Span::styled("Editing: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("Fan Curve", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("Hint: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Temp: 0-100, Speed: 0-255. Maintain non-decreasing order."),
+            ]),
+            Line::from("↑/↓ row   ←/→ col   Enter edit   Esc back"),
+        ],
+        _ => vec![
+            Line::from(vec![
+                Span::styled("Selected: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(item_title(selected), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("Hint: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(item_hint(selected)),
+            ]),
+            Line::from("↑/↓ move   ←/→ action   Enter edit/apply   Esc cancel   r refresh   q quit"),
+        ]
+    };
+    let help = Paragraph::new(help_text)
+        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .wrap(Wrap { trim: true });
     frame.render_widget(help, right[1]);
 
     let footer = Paragraph::new(if app.focus == Focus::Editing {
@@ -488,7 +602,7 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(footer, outer[2]);
 
     if app.focus == Focus::Editing {
-        let popup = centered_rect(56, 22, area);
+        let popup = centered_rect(56, 24, area);
         frame.render_widget(Clear, popup);
         let border_style = Style::default().fg(Color::Magenta);
         let popup_text = vec![
@@ -505,6 +619,7 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             Line::from(""),
             Line::from("Fan speed: 25..100 in steps of 5"),
             Line::from("Charge limit: 60..100"),
+            Line::from("Curve Temp: 0..100 | Curve Speed: 0..255"),
         ];
         frame.render_widget(
             Paragraph::new(popup_text)
@@ -522,6 +637,33 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Enter => app.apply_edit(),
             KeyCode::Backspace => app.backspace_input(),
             KeyCode::Char(c) => app.push_input(c),
+            _ => {}
+        }
+        return false;
+    }
+
+    if app.focus == Focus::FanCurveList {
+        match key.code {
+            KeyCode::Esc => app.focus = Focus::Normal,
+            KeyCode::Up => {
+                if app.fan_curve_selected > 0 { app.fan_curve_selected -= 1; }
+            }
+            KeyCode::Down => {
+                if app.fan_curve_selected < 14 { app.fan_curve_selected += 1; }
+            }
+            KeyCode::Left => {
+                app.fan_curve_col = 0;
+            }
+            KeyCode::Right => {
+                app.fan_curve_col = 1;
+            }
+            KeyCode::Enter => {
+                if let Some(curve) = &app.fan_curve {
+                    let val = if app.fan_curve_col == 0 { curve[app.fan_curve_selected].0 } else { curve[app.fan_curve_selected].1 };
+                    let target = if app.fan_curve_col == 0 { EditTarget::FanCurveTemp(app.fan_curve_selected) } else { EditTarget::FanCurveSpeed(app.fan_curve_selected) };
+                    app.start_edit(target, Some(val));
+                }
+            }
             _ => {}
         }
         return false;
@@ -553,6 +695,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, 2, 1, "Charge mode"),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
             Item::GpuBoost => app.toggle_gpu_boost(),
+            Item::FanCurveEditor => app.focus = Focus::FanCurveList,
             Item::Refresh => {
                 app.refresh();
                 app.set_status("Refreshed values");
@@ -562,6 +705,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('e') => match app.selected_item() {
             Item::FanCustomSpeed => app.start_edit(EditTarget::FanCustomSpeed, app.fan_custom_speed),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
+            Item::FanCurveEditor => app.focus = Focus::FanCurveList,
             _ => {}
         },
         _ => {}
@@ -584,7 +728,6 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) {
 }
 
 fn main() -> Result<()> {
-    // 1. Initial Root Check
     if !is_root() {
         println!("This program requires root privileges.");
         print!("Do you want to run with sudo? [y/n]: ");
