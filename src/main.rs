@@ -730,7 +730,7 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) {
 fn main() -> Result<()> {
     if !is_root() {
         println!("This program requires root privileges.");
-        print!("Do you want to run with sudo? [y/n]: ");
+        print!("Do you want to run with sudo? [Y/n]: ");
 
         use std::io::{self, Write};
         io::stdout().flush().ok();
@@ -738,14 +738,15 @@ fn main() -> Result<()> {
         let mut input = String::new();
         io::stdin().read_line(&mut input).ok();
 
-        if input.trim().eq_ignore_ascii_case("y") {
+        let input = input.trim().to_lowercase();
+
+        if input.is_empty() || input == "y" {
             run_sudo();
         } else {
             println!("Exiting.");
             std::process::exit(1);
         }
     }
-
 
     if !driver_present() {
         eprintln!("{} does not exist. Please install gigabyte-laptop-wmi and ensure it is running.", ROOT);
