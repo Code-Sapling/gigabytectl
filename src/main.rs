@@ -20,8 +20,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
+    symbols
 };
 
 const ROOT: &str = "/sys/devices/platform/aorus_laptop";
@@ -43,7 +44,8 @@ enum Item {
     ChargeMode,
     ChargeLimit,
     GpuBoost,
-    FanCurveEditor,
+    FanCurveView,
+    FanCurveEdit,  
     Refresh,
     Quit,
 }
@@ -94,7 +96,8 @@ impl App {
                 Item::ChargeMode,
                 Item::ChargeLimit,
                 Item::GpuBoost,
-                Item::FanCurveEditor,
+                Item::FanCurveView,
+                Item::FanCurveEdit,
                 Item::Refresh,
                 Item::Quit,
             ],
@@ -372,7 +375,8 @@ fn item_title(item: Item) -> &'static str {
         Item::ChargeMode => "Charging mode",
         Item::ChargeLimit => "Charging limit",
         Item::GpuBoost => "GPU boost",
-        Item::FanCurveEditor => "Fan curve editor",
+        Item::FanCurveView => "Fan curve (View)",
+        Item::FanCurveEdit => "Fan curve (Edit)",      
         Item::Refresh => "Refresh values",
         Item::Quit => "Quit",
     }
@@ -385,7 +389,8 @@ fn item_hint(item: Item) -> &'static str {
         Item::ChargeMode => "Left/Right toggles Normal/Custom",
         Item::ChargeLimit => "Enter 60..100",
         Item::GpuBoost => "Left/Right toggles ON/OFF",
-        Item::FanCurveEditor => "Press Enter to open the fan curve editor",
+        Item::FanCurveView => "Shows a visual graph of the current fan curve",
+        Item::FanCurveEdit => "Press Enter to edit the fan curve table",      
         Item::Refresh => "Reload all sysfs nodes",
         Item::Quit => "Exit the app",
     }
@@ -498,7 +503,46 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let selected = app.selected_item();
 
-    if app.focus == Focus::FanCurveList || selected == Item::FanCurveEditor {
+    if selected == Item::FanCurveView {
+        // --- 1. VIEW MODE (Read-only Chart) ---
+        if let Some(curve) = &app.fan_curve {
+            let data_points: Vec<(f64, f64)> = curve
+                .iter()
+                .map(|&(t, s)| (t as f64, s as f64))
+                .collect();
+
+            let datasets = vec![Dataset::default()
+                .name("Curve")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(&data_points)];
+
+            let x_axis = Axis::default()
+                .title("Temp (°C)")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, 100.0])
+                .labels(vec![Span::raw("0"), Span::raw("50"), Span::raw("100")]);
+
+            let y_axis = Axis::default()
+                .title("Speed")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, 255.0])
+                .labels(vec![Span::raw("0"), Span::raw("128"), Span::raw("255")]);
+
+            let chart = Chart::new(datasets)
+                .block(Block::default().borders(Borders::ALL).title("Fan Curve Graph"))
+                .x_axis(x_axis)
+                .y_axis(y_axis);
+
+            frame.render_widget(chart, right[0]);
+        } else {
+            let fc_widget = Paragraph::new("Failed to read fan curve data.")
+                .block(Block::default().borders(Borders::ALL).title("Fan Curve Graph"));
+            frame.render_widget(fc_widget, right[0]);
+        }
+    } else if app.focus == Focus::FanCurveList || selected == Item::FanCurveEdit {
+        // --- 2. EDIT MODE (Interactive Table) ---
         let mut lines = vec![];
         lines.push(Line::from(vec![
             Span::styled(format!("{:>3}  ", "Idx"), Style::default().add_modifier(Modifier::BOLD)),
@@ -525,7 +569,7 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         }
 
         let fc_widget = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Fan Curve"))
+            .block(Block::default().borders(Borders::ALL).title("Fan Curve Editor"))
             .wrap(Wrap { trim: true });
         frame.render_widget(fc_widget, right[0]);
     } else {
@@ -695,7 +739,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, 2, 1, "Charge mode"),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
             Item::GpuBoost => app.toggle_gpu_boost(),
-            Item::FanCurveEditor => app.focus = Focus::FanCurveList,
+            Item::FanCurveEdit => app.focus = Focus::FanCurveList, // <-- Updated
+            Item::FanCurveView => {}, // <-- Added (does nothing on Enter, just views)
             Item::Refresh => {
                 app.refresh();
                 app.set_status("Refreshed values");
@@ -705,9 +750,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('e') => match app.selected_item() {
             Item::FanCustomSpeed => app.start_edit(EditTarget::FanCustomSpeed, app.fan_custom_speed),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
-            Item::FanCurveEditor => app.focus = Focus::FanCurveList,
+            Item::FanCurveEdit => app.focus = Focus::FanCurveList, // <-- Updated
             _ => {}
-        },
+        },        
         _ => {}
     }
 
