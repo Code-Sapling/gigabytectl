@@ -2,26 +2,20 @@
 
 A simple Rust-based TUI tool for controlling laptops using the `gigabyte-laptop-wmi` kernel module.
 
----
 
-## 📦 Installation
+## ⬇️ Installation
 
-### Method 1: Using Cargo
+### Method 1: 🦀 Using Cargo
 
 ```bash
 cargo install gigabytectl
 ```
 
-> ⚠️ Cargo installs binaries to `~/.cargo/bin`.  
-> Make sure it’s in your `PATH`:
->
-> ```bash
-> export PATH="$HOME/.cargo/bin:$PATH"
-> ```
+> Cargo installs binaries to `~/.cargo/bin`.  
+> Make sure it’s in your `PATH`
 
----
 
-### Method 2: Prebuilt Binary (GitHub Releases)
+### Method 2: 📦 Prebuilt Binary (GitHub Releases)
 
 Download the latest release, then:
 
@@ -36,9 +30,8 @@ chmod +x gigabytectl
 sudo ./gigabytectl
 ```
 
----
 
-### 📌 Optional: Install system-wide
+#### ▶ Optional: Install system-wide
 
 ```bash
 sudo install -Dm755 gigabytectl /usr/local/bin/gigabytectl
@@ -50,7 +43,6 @@ Then you can run:
 sudo gigabytectl
 ```
 
----
 
 ## ⚠️ Permissions
 
@@ -66,7 +58,6 @@ So it must be run with:
 sudo gigabytectl
 ```
 
----
 
 ## 🧹 Uninstall
 
@@ -83,3 +74,17 @@ cargo uninstall gigabytectl
 ```
 
 
+## ↻ Update
+
+### Method 1: 🦀 Using Cargo
+
+```bash
+cargo install gigabytectl --force
+```
+
+### Method 2: 📦 Prebuilt Binary (GitHub Releases)
+
+If you installed using a prebuilt binary, simply:
+
+- [Uninstall](https://github.com/Code-Sapling/gigabytectl#-uninstall)
+- [Reinstall](https://github.com/Code-Sapling/gigabytectl#method-2-prebuilt-binary-github-releases)
