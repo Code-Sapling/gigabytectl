@@ -87,4 +87,4 @@ cargo install gigabytectl --force
 If you installed using a prebuilt binary, simply:
 
 - [Uninstall](https://github.com/Code-Sapling/gigabytectl#-uninstall)
-- [Reinstall](https://github.com/Code-Sapling/gigabytectl#method-2-prebuilt-binary-github-releases)
+- [Reinstall](https://github.com/Code-Sapling/gigabytectl#method-2--prebuilt-binary-github-releases)
