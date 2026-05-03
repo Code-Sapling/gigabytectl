@@ -4,14 +4,10 @@ A simple Rust-based TUI tool for controlling laptops using the `gigabyte-laptop-
 
 ## 📸 Preview
 
-### Main Dashboard
-![dashboard](assets/dashboard.png)
+![preview](assets/preview.gif)
 
-### Fan Curve Graph
-![graph](assets/graph.png)
-
-### Fan Curve Editor
-![editor](assets/editor.png)
+See More:
+[Assets](assets)
 
 ## ✨ Features
 
@@ -32,8 +28,8 @@ A simple Rust-based TUI tool for controlling laptops using the `gigabyte-laptop-
 cargo install gigabytectl
 ```
 
-> Cargo installs binaries to `~/.cargo/bin`.  
-> Make sure it’s in your `PATH`
+> If `gigabytectl` is not found after installation, make sure `~/.cargo/bin` is in your `PATH`.  
+> See the [Cargo PATH Setup](https://github.com/Code-Sapling/gigabytectl#-cargo-path-setup) section below.
 
 
 ### Method 2: 📦 Prebuilt Binary (GitHub Releases)
