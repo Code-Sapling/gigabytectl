@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Stdout},
     os::unix::fs::MetadataExt,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
     process::Command
 };
@@ -36,6 +36,86 @@ const FAN_CURVE_INDEX: &str = "/sys/devices/platform/aorus_laptop/fan_curve_inde
 const FAN_CURVE_DATA: &str = "/sys/devices/platform/aorus_laptop/fan_curve_data";
 
 const FAN_MODES: [&str; 6] = ["Normal", "Silent", "Gaming", "Custom", "Auto", "Fixed"];
+
+// --- Hardware Monitor Structs ---
+
+#[derive(Debug, Clone)]
+pub struct Fan {
+    pub name: String,
+    pub rpm: u32,
+}
+
+#[derive(Debug)]
+pub struct GigabyteHwmon {
+    hwmon_path: PathBuf,
+}
+
+impl GigabyteHwmon {
+    /// 1️⃣ INIT FUNCTION
+    pub fn new() -> Option<Self> {
+        let base = "/sys/class/hwmon";
+
+        // Safely iterate through hwmon directories
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name_file = path.join("name");
+                
+                if let Ok(content) = fs::read_to_string(&name_file) {
+                    if content.trim() == "aorus_laptop" {
+                        return Some(Self { hwmon_path: path });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 2️⃣ READ FUNCTION (only non-zero fans)
+    pub fn read_fans(&self) -> Vec<Fan> {
+        let mut fans = Vec::new();
+
+        let entries = match fs::read_dir(&self.hwmon_path) {
+            Ok(e) => e,
+            Err(_) => return fans,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            if file_name.starts_with("fan") && file_name.ends_with("_input") {
+                let Ok(content) = fs::read_to_string(&path) else {
+                    continue;
+                };
+
+                let Ok(rpm) = content.trim().parse::<u32>() else {
+                    continue;
+                };
+
+                if rpm == 0 {
+                    continue;
+                }
+
+                // Clean up name: "fan1_input" -> "Fan 1"
+                let num_part = &file_name[3..file_name.len() - 6];
+                let display_name = format!("Fan {}", num_part);
+
+                fans.push(Fan {
+                    name: display_name,
+                    rpm,
+                });
+            }
+        }
+
+        fans
+    }
+}
+
+// --- App State ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Item {
@@ -84,6 +164,9 @@ struct App {
     fan_curve_selected: usize,
     fan_curve_col: usize, // 0 = Temp, 1 = Speed
 
+    hwmon: Option<GigabyteHwmon>,
+    live_fans: Vec<Fan>,
+
     last_refresh: Instant,
 }
 
@@ -115,6 +198,8 @@ impl App {
             fan_curve: None,
             fan_curve_selected: 0,
             fan_curve_col: 0,
+            hwmon: GigabyteHwmon::new(),
+            live_fans: Vec::new(),
             last_refresh: Instant::now(),
         }
     }
@@ -127,6 +212,12 @@ impl App {
         self.gpu_boost = read_i32(GPU_BOOST);
         self.battery_cycle = read_trimmed(BATTERY_CYCLE);
         self.fan_curve = read_fan_curve();
+        
+        // Fetch Live Fans
+        if let Some(hwmon) = &self.hwmon {
+            self.live_fans = hwmon.read_fans();
+        }
+
         self.last_refresh = Instant::now();
     }
 
@@ -250,6 +341,8 @@ impl App {
     }
 }
 
+// --- Utilities ---
+
 fn read_trimmed(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -367,6 +460,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(vertical[1])[1]
 }
+
+// --- UI Components ---
 
 fn item_title(item: Item) -> &'static str {
     match item {
@@ -573,11 +668,12 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             .wrap(Wrap { trim: true });
         frame.render_widget(fc_widget, right[0]);
     } else {
+        // --- 3. NORMAL DASHBOARD MODE ---
         let fan_mode_text = fan_mode_name(app.fan_mode);
         let gpu_text = gpu_boost_name(app.gpu_boost);
         let charge_text = charge_mode_name(app.charge_mode);
 
-        let dashboard = Paragraph::new(vec![
+        let mut dash_lines = vec![
             Line::from(vec![
                 Span::styled("Fan mode       ", Style::default().fg(Color::White)),
                 Span::styled(fan_mode_text.clone(), badge_style(&fan_mode_text)),
@@ -602,9 +698,23 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Span::styled("Battery cycle  ", Style::default().fg(Color::White)),
                 Span::styled(battery_cycle_text(app.battery_cycle.clone()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             ]),
-        ])
-        .block(Block::default().borders(Borders::ALL).title("Current values"))
-        .wrap(Wrap { trim: true });
+        ];
+
+        // Real-time Fan Monitor Update
+        if !app.live_fans.is_empty() {
+            dash_lines.push(Line::from(""));
+            dash_lines.push(Line::from(Span::styled("Fan readings:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+            for fan in &app.live_fans {
+                dash_lines.push(Line::from(vec![
+                    Span::styled(format!("{:14} ", fan.name), Style::default().fg(Color::White)),
+                    Span::styled(format!("{} RPM", fan.rpm), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                ]));
+            }
+        }
+
+        let dashboard = Paragraph::new(dash_lines)
+            .block(Block::default().borders(Borders::ALL).title("Current values"))
+            .wrap(Wrap { trim: true });
         frame.render_widget(dashboard, right[0]);
     }
 
@@ -674,6 +784,8 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     }
 }
 
+// --- Event Handling ---
+
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.focus == Focus::Editing {
         match key.code {
@@ -739,8 +851,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, 2, 1, "Charge mode"),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
             Item::GpuBoost => app.toggle_gpu_boost(),
-            Item::FanCurveEdit => app.focus = Focus::FanCurveList, // <-- Updated
-            Item::FanCurveView => {}, // <-- Added (does nothing on Enter, just views)
+            Item::FanCurveEdit => app.focus = Focus::FanCurveList,
+            Item::FanCurveView => {},
             Item::Refresh => {
                 app.refresh();
                 app.set_status("Refreshed values");
@@ -750,7 +862,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('e') => match app.selected_item() {
             Item::FanCustomSpeed => app.start_edit(EditTarget::FanCustomSpeed, app.fan_custom_speed),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
-            Item::FanCurveEdit => app.focus = Focus::FanCurveList, // <-- Updated
+            Item::FanCurveEdit => app.focus = Focus::FanCurveList, 
             _ => {}
         },        
         _ => {}
@@ -758,6 +870,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     false
 }
+
+// --- Entry Point & Setup ---
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     terminal::enable_raw_mode().context("enable raw mode")?;
@@ -807,6 +921,11 @@ fn main() -> Result<()> {
 
     let run = (|| -> Result<()> {
         loop {
+            // Auto-refresh every 1 second
+            if app.last_refresh.elapsed() >= Duration::from_secs(1) {
+                app.refresh();
+            }
+
             terminal.draw(|f| ui(f, &app)).context("draw ui")?;
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
