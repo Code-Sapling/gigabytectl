@@ -63,20 +63,20 @@ sudo gigabytectl
 
 ## ⚠️ Permissions
 
-This tool requires root privileges to access:
+This tool requires root privileges to access `/sys`.
 
-```
-/sys/devices/platform/aorus_laptop/
-AND
-/sys/class/hwmon
-```
+If you are not running with `sudo`, the app will prompt you on startup:
 
-So it must be run with:
+- Press `y` or `Enter` → continue with root privileges (`sudo`)
+- Press `n` → exit
+
+You can also run it directly with `sudo`:
 
 ```bash
 sudo gigabytectl
-```
+``` 
 
+If you encounter issues (especially when using `cargo`), `sudo` may cause path issues. In that case, try running without `sudo` and then choose `y` when prompted, or simply press Enter.
 
 ## 🧹 Uninstall
 
