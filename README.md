@@ -2,6 +2,27 @@
 
 A simple Rust-based TUI tool for controlling laptops using the `gigabyte-laptop-wmi` kernel module.
 
+## 📸 Preview
+
+### Main Dashboard
+![dashboard](assets/dashboard.png)
+
+### Fan Curve Graph
+![graph](assets/graph.png)
+
+### Fan Curve Editor
+![editor](assets/editor.png)
+
+## ✨ Features
+
+- View fan speeds in real time
+- Control fan speed via a simple TUI
+- Lightweight and fast (written in Rust)
+- Direct integration with `gigabyte-laptop-wmi`
+- No background services or daemons required
+- Works directly with `/sys` interfaces
+- Minimal dependencies
+- Keyboard-driven interface
 
 ## ⬇️ Installation
 
@@ -50,6 +71,8 @@ This tool requires root privileges to access:
 
 ```
 /sys/devices/platform/aorus_laptop/
+AND
+/sys/class/hwmon
 ```
 
 So it must be run with:
@@ -88,6 +111,28 @@ If you installed using a prebuilt binary, simply:
 
 - [Uninstall](https://github.com/Code-Sapling/gigabytectl#-uninstall)
 - [Reinstall](https://github.com/Code-Sapling/gigabytectl#method-2--prebuilt-binary-github-releases)
+
+## 💻 Compatibility
+
+Works on Gigabyte / AORUS laptops using the `gigabyte-laptop-wmi` kernel module.
+> You need the `gigabyte-laptop-wmi` kernel module.
+
+## 🦀 Cargo PATH Setup
+
+Cargo installs binaries to:
+
+```
+~/.cargo/bin
+```
+
+If this directory is not in your `PATH`, you won’t be able to run installed binaries.
+
+To add it, run:
+
+```bash
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+```
+Then restart your terminal
 
 ## 🤖 AI Usage
 
