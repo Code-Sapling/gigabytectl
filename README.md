@@ -76,7 +76,7 @@ You can also run it directly with `sudo`:
 sudo gigabytectl
 ``` 
 
-If you encounter issues (especially when using `cargo`), `sudo` may cause path issues. In that case, try running without `sudo` and then choose `y` when prompted, or simply press Enter.
+If you encounter issues (especially when installed using `cargo`), `sudo` may cause path issues. In that case, try running without `sudo` and then choose `y` when prompted, or simply press Enter.
 
 ## 🧹 Uninstall
 
