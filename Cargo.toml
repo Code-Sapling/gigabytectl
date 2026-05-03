@@ -1,6 +1,6 @@
 [package]
 name = "gigabytectl"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A simple Rust-based TUI tool for controlling laptops using the gigabyte-laptop-wmi kernel module."
 license = "MIT"

@@ -88,3 +88,11 @@ If you installed using a prebuilt binary, simply:
 
 - [Uninstall](https://github.com/Code-Sapling/gigabytectl#-uninstall)
 - [Reinstall](https://github.com/Code-Sapling/gigabytectl#method-2--prebuilt-binary-github-releases)
+
+## 🤖 AI Usage
+
+This project was built with the help of AI tools. AI was used for code generation and documentation. All final decisions and testing were handled by me.
+
+## 💥 Issues
+
+If you find any problems or bugs, feel free to open an issue. Feedback and improvements are always welcome.
