@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     execute,
@@ -271,38 +272,16 @@ impl App {
         };
 
         let result: Result<()> = match target {
-            EditTarget::FanCustomSpeed => {
-                if (25..=100).contains(&value) && value % 5 == 0 {
-                    write_value(FAN_CUSTOM_SPEED, value)
-                } else {
-                    Err(anyhow::anyhow!("Fan speed must be 25..100 and divisible by 5"))
-                }
-            }
-            EditTarget::ChargeLimit => {
-                if (60..=100).contains(&value) {
-                    write_value(CHARGE_LIMIT, value)
-                } else {
-                    Err(anyhow::anyhow!("Charge limit must be 60..100"))
-                }
-            }
-            EditTarget::FanCurveTemp(idx) => {
-                if (0..=100).contains(&value) {
-                    if let Some(curve) = &self.fan_curve {
-                        write_fan_curve_point(idx, value, curve[idx].1)
-                    } else { Err(anyhow::anyhow!("Curve not loaded")) }
-                } else {
-                    Err(anyhow::anyhow!("Temperature must be 0..100"))
-                }
-            }
-            EditTarget::FanCurveSpeed(idx) => {
-                if (0..=255).contains(&value) {
-                    if let Some(curve) = &self.fan_curve {
-                        write_fan_curve_point(idx, curve[idx].0, value)
-                    } else { Err(anyhow::anyhow!("Curve not loaded")) }
-                } else {
-                    Err(anyhow::anyhow!("Speed must be 0..255"))
-                }
-            }
+            EditTarget::FanCustomSpeed => validate_fan_speed(value).and_then(|()| write_value(FAN_CUSTOM_SPEED, value)),
+            EditTarget::ChargeLimit => validate_charge_limit(value).and_then(|()| write_value(CHARGE_LIMIT, value)),
+            EditTarget::FanCurveTemp(idx) => validate_curve_temp(value).and_then(|()| {
+                let curve = self.fan_curve.as_ref().ok_or_else(|| anyhow::anyhow!("Curve not loaded"))?;
+                write_fan_curve_point(idx, value, curve[idx].1)
+            }),
+            EditTarget::FanCurveSpeed(idx) => validate_curve_speed(value).and_then(|()| {
+                let curve = self.fan_curve.as_ref().ok_or_else(|| anyhow::anyhow!("Curve not loaded"))?;
+                write_fan_curve_point(idx, curve[idx].0, value)
+            }),
         };
 
         match result {
@@ -341,7 +320,292 @@ impl App {
     }
 }
 
+// --- CLI ---
+
+#[derive(Parser)]
+#[command(name = "gigabytectl", version, about = "Control panel for gigabyte-laptop-wmi")]
+struct Cli {
+    /// Run a one-shot command instead of launching the TUI
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Show current status of all controllable values
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get or set the fan mode
+    FanMode {
+        #[command(subcommand)]
+        action: FanModeAction,
+    },
+    /// Get or set the custom fan speed (25..100, step 5)
+    FanSpeed {
+        #[command(subcommand)]
+        action: ValueAction,
+    },
+    /// Get or set the charging mode
+    ChargeMode {
+        #[command(subcommand)]
+        action: ChargeModeAction,
+    },
+    /// Get or set the charge limit (60..100)
+    ChargeLimit {
+        #[command(subcommand)]
+        action: ValueAction,
+    },
+    /// Get or set GPU boost
+    GpuBoost {
+        #[command(subcommand)]
+        action: OnOffAction,
+    },
+    /// Show the battery cycle count
+    BatteryCycle,
+    /// Show live fan RPM readings
+    Fans,
+    /// Get or set fan curve points
+    FanCurve {
+        #[command(subcommand)]
+        action: FanCurveAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FanModeAction {
+    Get,
+    Set { mode: FanModeArg },
+}
+
+#[derive(Subcommand)]
+enum ValueAction {
+    Get,
+    Set { value: i32 },
+}
+
+#[derive(Subcommand)]
+enum ChargeModeAction {
+    Get,
+    Set { mode: ChargeModeArg },
+}
+
+#[derive(Subcommand)]
+enum OnOffAction {
+    Get,
+    Set { state: OnOff },
+}
+
+#[derive(Subcommand)]
+enum FanCurveAction {
+    /// Print one point (if index given) or the whole curve
+    Get { index: Option<usize> },
+    /// Set the (temp, speed) pair at an index (0..15)
+    Set { index: usize, temp: i32, speed: i32 },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum FanModeArg {
+    Normal,
+    Silent,
+    Gaming,
+    Custom,
+    Auto,
+    Fixed,
+}
+
+impl FanModeArg {
+    fn as_i32(self) -> i32 {
+        match self {
+            FanModeArg::Normal => 0,
+            FanModeArg::Silent => 1,
+            FanModeArg::Gaming => 2,
+            FanModeArg::Custom => 3,
+            FanModeArg::Auto => 4,
+            FanModeArg::Fixed => 5,
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum ChargeModeArg {
+    Normal,
+    Custom,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum OnOff {
+    On,
+    Off,
+}
+
+fn require_ready_for_cli() -> Result<()> {
+    if !is_root() {
+        anyhow::bail!("gigabytectl: must be run as root (try: sudo gigabytectl ...)");
+    }
+    if !driver_present() {
+        anyhow::bail!("{} does not exist. Please install gigabyte-laptop-wmi and ensure it is running.", ROOT);
+    }
+    Ok(())
+}
+
+fn run_cli(command: Commands) -> Result<()> {
+    require_ready_for_cli()?;
+
+    match command {
+        Commands::Status { json } => print_status(json),
+        Commands::FanMode { action } => match action {
+            FanModeAction::Get => println!("{}", fan_mode_name(read_i32(FAN_MODE)).to_lowercase()),
+            FanModeAction::Set { mode } => write_value(FAN_MODE, mode.as_i32())?,
+        },
+        Commands::FanSpeed { action } => match action {
+            ValueAction::Get => println!("{}", value_or_na(read_i32(FAN_CUSTOM_SPEED))),
+            ValueAction::Set { value } => {
+                validate_fan_speed(value)?;
+                write_value(FAN_CUSTOM_SPEED, value)?;
+            }
+        },
+        Commands::ChargeMode { action } => match action {
+            ChargeModeAction::Get => println!("{}", charge_mode_name(read_i32(CHARGE_MODE)).to_lowercase()),
+            ChargeModeAction::Set { mode } => {
+                let value = match mode {
+                    ChargeModeArg::Normal => 0,
+                    ChargeModeArg::Custom => 1,
+                };
+                write_value(CHARGE_MODE, value)?;
+            }
+        },
+        Commands::ChargeLimit { action } => match action {
+            ValueAction::Get => println!("{}", value_or_na(read_i32(CHARGE_LIMIT))),
+            ValueAction::Set { value } => {
+                validate_charge_limit(value)?;
+                write_value(CHARGE_LIMIT, value)?;
+            }
+        },
+        Commands::GpuBoost { action } => match action {
+            OnOffAction::Get => println!("{}", gpu_boost_name(read_i32(GPU_BOOST)).to_lowercase()),
+            OnOffAction::Set { state } => {
+                let value = match state {
+                    OnOff::On => 1,
+                    OnOff::Off => 0,
+                };
+                write_value(GPU_BOOST, value)?;
+            }
+        },
+        Commands::BatteryCycle => println!("{}", battery_cycle_text(read_trimmed(BATTERY_CYCLE))),
+        Commands::Fans => {
+            let fans = GigabyteHwmon::new().map(|h| h.read_fans()).unwrap_or_default();
+            if fans.is_empty() {
+                println!("No live fan readings available");
+            }
+            for fan in fans {
+                println!("{}: {} RPM", fan.name, fan.rpm);
+            }
+        }
+        Commands::FanCurve { action } => match action {
+            FanCurveAction::Get { index } => {
+                let curve = read_fan_curve().context("failed to read fan curve")?;
+                match index {
+                    Some(idx) => {
+                        let &(temp, speed) = curve.get(idx).context("index out of range (0..15)")?;
+                        println!("{} {} {}", idx, temp, speed);
+                    }
+                    None => {
+                        for (i, (temp, speed)) in curve.iter().enumerate() {
+                            println!("{} {} {}", i, temp, speed);
+                        }
+                    }
+                }
+            }
+            FanCurveAction::Set { index, temp, speed } => {
+                validate_curve_temp(temp)?;
+                validate_curve_speed(speed)?;
+                write_fan_curve_point(index, temp, speed)?;
+            }
+        },
+    }
+
+    Ok(())
+}
+
+fn print_status(json: bool) {
+    let fan_mode = fan_mode_name(read_i32(FAN_MODE));
+    let fan_speed = value_or_na(read_i32(FAN_CUSTOM_SPEED));
+    let charge_mode = charge_mode_name(read_i32(CHARGE_MODE));
+    let charge_limit = value_or_na(read_i32(CHARGE_LIMIT));
+    let gpu_boost = gpu_boost_name(read_i32(GPU_BOOST));
+    let battery_cycle = battery_cycle_text(read_trimmed(BATTERY_CYCLE));
+    let fans = GigabyteHwmon::new().map(|h| h.read_fans()).unwrap_or_default();
+
+    if json {
+        let fans_json: Vec<String> = fans
+            .iter()
+            .map(|f| format!(r#"{{"name":"{}","rpm":{}}}"#, f.name, f.rpm))
+            .collect();
+        println!(
+            r#"{{"fan_mode":"{}","fan_speed":"{}","charge_mode":"{}","charge_limit":"{}","gpu_boost":"{}","battery_cycle":"{}","fans":[{}]}}"#,
+            fan_mode.to_lowercase(),
+            fan_speed,
+            charge_mode.to_lowercase(),
+            charge_limit,
+            gpu_boost.to_lowercase(),
+            battery_cycle.replace('"', "\\\""),
+            fans_json.join(",")
+        );
+    } else {
+        println!("Fan mode:      {}", fan_mode);
+        println!("Fan speed:     {}", fan_speed);
+        println!("Charge mode:   {}", charge_mode);
+        println!("Charge limit:  {}", charge_limit);
+        println!("GPU boost:     {}", gpu_boost);
+        println!("Battery cycle: {}", battery_cycle);
+        if !fans.is_empty() {
+            println!("Fans:");
+            for fan in fans {
+                println!("  {}: {} RPM", fan.name, fan.rpm);
+            }
+        }
+    }
+}
+
 // --- Utilities ---
+
+fn validate_fan_speed(value: i32) -> Result<()> {
+    if (25..=100).contains(&value) && value % 5 == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Fan speed must be 25..100 and divisible by 5"))
+    }
+}
+
+fn validate_charge_limit(value: i32) -> Result<()> {
+    if (60..=100).contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Charge limit must be 60..100"))
+    }
+}
+
+fn validate_curve_temp(value: i32) -> Result<()> {
+    if (0..=100).contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Temperature must be 0..100"))
+    }
+}
+
+fn validate_curve_speed(value: i32) -> Result<()> {
+    if (0..=255).contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Speed must be 0..255"))
+    }
+}
 
 fn read_trimmed(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
@@ -887,6 +1151,14 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(command) => run_cli(command),
+        None => run_tui(),
+    }
+}
+
+fn run_tui() -> Result<()> {
     if !is_root() {
         println!("This program requires root privileges.");
         print!("Do you want to run with sudo? [Y/n]: ");
