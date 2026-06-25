@@ -37,6 +37,9 @@ const FAN_CURVE_INDEX: &str = "/sys/devices/platform/aorus_laptop/fan_curve_inde
 const FAN_CURVE_DATA: &str = "/sys/devices/platform/aorus_laptop/fan_curve_data";
 
 const FAN_MODES: [&str; 6] = ["Normal", "Silent", "Gaming", "Custom", "Auto", "Fixed"];
+const FAN_MODE_COUNT: i32 = FAN_MODES.len() as i32;
+const CHARGE_MODE_COUNT: i32 = 2;
+const FAN_CURVE_POINTS: usize = 15;
 
 // --- Hardware Monitor Structs ---
 
@@ -52,27 +55,24 @@ pub struct GigabyteHwmon {
 }
 
 impl GigabyteHwmon {
-    /// 1️⃣ INIT FUNCTION
     pub fn new() -> Option<Self> {
         let base = "/sys/class/hwmon";
 
-        // Safely iterate through hwmon directories
         if let Ok(entries) = fs::read_dir(base) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name_file = path.join("name");
-                
-                if let Ok(content) = fs::read_to_string(&name_file) {
-                    if content.trim() == "aorus_laptop" {
-                        return Some(Self { hwmon_path: path });
-                    }
+
+                if let Ok(content) = fs::read_to_string(&name_file)
+                    && content.trim() == "aorus_laptop"
+                {
+                    return Some(Self { hwmon_path: path });
                 }
             }
         }
         None
     }
 
-    /// 2️⃣ READ FUNCTION (only non-zero fans)
     pub fn read_fans(&self) -> Vec<Fan> {
         let mut fans = Vec::new();
 
@@ -101,7 +101,6 @@ impl GigabyteHwmon {
                     continue;
                 }
 
-                // Clean up name: "fan1_input" -> "Fan 1"
                 let num_part = &file_name[3..file_name.len() - 6];
                 let display_name = format!("Fan {}", num_part);
 
@@ -212,9 +211,8 @@ impl App {
         self.charge_limit = read_i32(CHARGE_LIMIT);
         self.gpu_boost = read_i32(GPU_BOOST);
         self.battery_cycle = read_trimmed(BATTERY_CYCLE);
-        self.fan_curve = read_fan_curve();
-        
-        // Fetch Live Fans
+        self.fan_curve = read_fan_curve().ok();
+
         if let Some(hwmon) = &self.hwmon {
             self.live_fans = hwmon.read_fans();
         }
@@ -323,7 +321,12 @@ impl App {
 // --- CLI ---
 
 #[derive(Parser)]
-#[command(name = "gigabytectl", version, about = "Control panel for gigabyte-laptop-wmi")]
+#[command(
+    name = "gigabytectl",
+    version,
+    about = "Control panel for gigabyte-laptop-wmi",
+    long_about = "Control panel for gigabyte-laptop-wmi.\n\nRun without a subcommand to launch the interactive TUI, or pass a subcommand to run a one-shot, scriptable command."
+)]
 struct Cli {
     /// Run a one-shot command instead of launching the TUI
     #[command(subcommand)]
@@ -376,25 +379,33 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum FanModeAction {
+    /// Print the current value
     Get,
+    /// Set a new value
     Set { mode: FanModeArg },
 }
 
 #[derive(Subcommand)]
 enum ValueAction {
+    /// Print the current value
     Get,
+    /// Set a new value
     Set { value: i32 },
 }
 
 #[derive(Subcommand)]
 enum ChargeModeAction {
+    /// Print the current value
     Get,
+    /// Set a new value
     Set { mode: ChargeModeArg },
 }
 
 #[derive(Subcommand)]
 enum OnOffAction {
+    /// Print the current value
     Get,
+    /// Set a new value
     Set { state: OnOff },
 }
 
@@ -445,12 +456,8 @@ enum OnOff {
 }
 
 fn require_ready_for_cli() -> Result<()> {
-    if !is_root() {
-        anyhow::bail!("gigabytectl: must be run as root (try: sudo gigabytectl ...)");
-    }
-    if !driver_present() {
-        anyhow::bail!("{} does not exist. Please install gigabyte-laptop-wmi and ensure it is running.", ROOT);
-    }
+    anyhow::ensure!(is_root(), "gigabytectl: must be run as root (try: sudo gigabytectl ...)");
+    anyhow::ensure!(driver_present(), "{}", driver_missing_message());
     Ok(())
 }
 
@@ -509,10 +516,11 @@ fn run_cli(command: Commands) -> Result<()> {
         }
         Commands::FanCurve { action } => match action {
             FanCurveAction::Get { index } => {
-                let curve = read_fan_curve().context("failed to read fan curve")?;
+                let curve = read_fan_curve()?;
                 match index {
                     Some(idx) => {
-                        let &(temp, speed) = curve.get(idx).context("index out of range (0..15)")?;
+                        validate_curve_index(idx)?;
+                        let (temp, speed) = curve[idx];
                         println!("{} {} {}", idx, temp, speed);
                     }
                     None => {
@@ -545,16 +553,16 @@ fn print_status(json: bool) {
     if json {
         let fans_json: Vec<String> = fans
             .iter()
-            .map(|f| format!(r#"{{"name":"{}","rpm":{}}}"#, f.name, f.rpm))
+            .map(|f| format!(r#"{{"name":"{}","rpm":{}}}"#, json_escape(&f.name), f.rpm))
             .collect();
         println!(
             r#"{{"fan_mode":"{}","fan_speed":"{}","charge_mode":"{}","charge_limit":"{}","gpu_boost":"{}","battery_cycle":"{}","fans":[{}]}}"#,
-            fan_mode.to_lowercase(),
-            fan_speed,
-            charge_mode.to_lowercase(),
-            charge_limit,
-            gpu_boost.to_lowercase(),
-            battery_cycle.replace('"', "\\\""),
+            json_escape(&fan_mode.to_lowercase()),
+            json_escape(&fan_speed),
+            json_escape(&charge_mode.to_lowercase()),
+            json_escape(&charge_limit),
+            json_escape(&gpu_boost.to_lowercase()),
+            json_escape(&battery_cycle),
             fans_json.join(",")
         );
     } else {
@@ -616,33 +624,39 @@ fn read_i32(path: &str) -> Option<i32> {
 }
 
 fn write_value(path: &str, value: i32) -> Result<()> {
-    if !Path::new(path).exists() {
-        anyhow::bail!("Node not found: {}", path);
-    }
+    anyhow::ensure!(Path::new(path).exists(), "Node not found: {}", path);
     fs::write(path, format!("{}\n", value)).with_context(|| format!("write {} -> {}", value, path))?;
     Ok(())
 }
 
-fn read_fan_curve() -> Option<Vec<(i32, i32)>> {
-    let mut curve = Vec::new();
-    for i in 0..15 {
-        if write_value(FAN_CURVE_INDEX, i).is_err() {
-            return None;
-        }
-        let data = read_trimmed(FAN_CURVE_DATA)?;
-        let parts: Vec<&str> = data.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let temp = parts[0].parse::<i32>().ok()?;
-            let speed = parts[1].parse::<i32>().ok()?;
-            curve.push((temp, speed));
-        } else {
-            return None;
-        }
+fn read_fan_curve() -> Result<Vec<(i32, i32)>> {
+    let mut curve = Vec::with_capacity(FAN_CURVE_POINTS);
+    for i in 0..FAN_CURVE_POINTS {
+        write_value(FAN_CURVE_INDEX, i as i32).with_context(|| format!("selecting fan curve index {}", i))?;
+        let data = read_trimmed(FAN_CURVE_DATA).with_context(|| format!("reading fan curve data at index {}", i))?;
+
+        let mut parts = data.split_whitespace();
+        let temp = parts
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .with_context(|| format!("parsing fan curve temperature at index {}", i))?;
+        let speed = parts
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .with_context(|| format!("parsing fan curve speed at index {}", i))?;
+
+        curve.push((temp, speed));
     }
-    Some(curve)
+    Ok(curve)
+}
+
+fn validate_curve_index(index: usize) -> Result<()> {
+    anyhow::ensure!(index < FAN_CURVE_POINTS, "Index must be 0..{}", FAN_CURVE_POINTS);
+    Ok(())
 }
 
 fn write_fan_curve_point(index: usize, temp: i32, speed: i32) -> Result<()> {
+    validate_curve_index(index)?;
     write_value(FAN_CURVE_INDEX, index as i32)?;
     let data = (speed * 256) + temp;
     write_value(FAN_CURVE_DATA, data)?;
@@ -677,6 +691,22 @@ fn value_or_na(v: Option<i32>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "N/A".to_string())
 }
 
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn battery_cycle_text(v: Option<String>) -> String {
     match v.as_deref() {
         Some("0") => "Device does not support this feature".to_string(),
@@ -689,20 +719,24 @@ fn is_root() -> bool {
     fs::metadata("/proc/self").map(|m| m.uid() == 0).unwrap_or(false)
 }
 
-fn run_sudo() {
-    let exe = std::env::current_exe().expect("failed to get current exe");
+fn run_sudo() -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
 
     let status = Command::new("sudo")
         .arg(exe)
         .args(std::env::args().skip(1))
         .status()
-        .expect("failed to execute sudo");
+        .context("failed to execute sudo")?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
 
 fn driver_present() -> bool {
     Path::new(ROOT).exists()
+}
+
+fn driver_missing_message() -> String {
+    format!("{} does not exist. Please install gigabyte-laptop-wmi and ensure it is running.", ROOT)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1065,12 +1099,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.focus == Focus::FanCurveList {
         match key.code {
             KeyCode::Esc => app.focus = Focus::Normal,
-            KeyCode::Up => {
-                if app.fan_curve_selected > 0 { app.fan_curve_selected -= 1; }
-            }
-            KeyCode::Down => {
-                if app.fan_curve_selected < 14 { app.fan_curve_selected += 1; }
-            }
+            KeyCode::Up => app.fan_curve_selected = app.fan_curve_selected.saturating_sub(1),
+            KeyCode::Down => app.fan_curve_selected = (app.fan_curve_selected + 1).min(FAN_CURVE_POINTS - 1),
             KeyCode::Left => {
                 app.fan_curve_col = 0;
             }
@@ -1098,21 +1128,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         KeyCode::Left => match app.selected_item() {
-            Item::FanMode => app.cycle(FAN_MODE, app.fan_mode, 6, -1, "Fan mode"),
-            Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, 2, -1, "Charge mode"),
+            Item::FanMode => app.cycle(FAN_MODE, app.fan_mode, FAN_MODE_COUNT, -1, "Fan mode"),
+            Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, CHARGE_MODE_COUNT, -1, "Charge mode"),
             Item::GpuBoost => app.toggle_gpu_boost(),
             _ => {}
         },
         KeyCode::Right => match app.selected_item() {
-            Item::FanMode => app.cycle(FAN_MODE, app.fan_mode, 6, 1, "Fan mode"),
-            Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, 2, 1, "Charge mode"),
+            Item::FanMode => app.cycle(FAN_MODE, app.fan_mode, FAN_MODE_COUNT, 1, "Fan mode"),
+            Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, CHARGE_MODE_COUNT, 1, "Charge mode"),
             Item::GpuBoost => app.toggle_gpu_boost(),
             _ => {}
         },
         KeyCode::Enter => match app.selected_item() {
-            Item::FanMode => app.cycle(FAN_MODE, app.fan_mode, 6, 1, "Fan mode"),
+            Item::FanMode => app.cycle(FAN_MODE, app.fan_mode, FAN_MODE_COUNT, 1, "Fan mode"),
             Item::FanCustomSpeed => app.start_edit(EditTarget::FanCustomSpeed, app.fan_custom_speed),
-            Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, 2, 1, "Charge mode"),
+            Item::ChargeMode => app.cycle(CHARGE_MODE, app.charge_mode, CHARGE_MODE_COUNT, 1, "Charge mode"),
             Item::ChargeLimit => app.start_edit(EditTarget::ChargeLimit, app.charge_limit),
             Item::GpuBoost => app.toggle_gpu_boost(),
             Item::FanCurveEdit => app.focus = Focus::FanCurveList,
@@ -1150,6 +1180,16 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) {
     let _ = terminal.show_cursor();
 }
 
+/// Ensures a panic doesn't leave the user's terminal stuck in raw/alternate-screen mode.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        default_hook(info);
+    }));
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -1172,7 +1212,7 @@ fn run_tui() -> Result<()> {
         let input = input.trim().to_lowercase();
 
         if input.is_empty() || input == "y" {
-            run_sudo();
+            run_sudo()?;
         } else {
             println!("Exiting.");
             std::process::exit(1);
@@ -1180,10 +1220,11 @@ fn run_tui() -> Result<()> {
     }
 
     if !driver_present() {
-        eprintln!("{} does not exist. Please install gigabyte-laptop-wmi and ensure it is running.", ROOT);
+        eprintln!("{}", driver_missing_message());
         std::process::exit(1);
     }
 
+    install_panic_hook();
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
     app.refresh();
@@ -1201,12 +1242,11 @@ fn run_tui() -> Result<()> {
             terminal.draw(|f| ui(f, &app)).context("draw ui")?;
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout).context("poll events")? {
-                if let Event::Key(key) = event::read().context("read event")? {
-                    if handle_key(&mut app, key) {
-                        break;
-                    }
-                }
+            if event::poll(timeout).context("poll events")?
+                && let Event::Key(key) = event::read().context("read event")?
+                && handle_key(&mut app, key)
+            {
+                break;
             }
 
             if last_tick.elapsed() >= tick_rate {
