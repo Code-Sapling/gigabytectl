@@ -13,6 +13,7 @@ See More:
 
 - View fan speeds in real time
 - Control fan speed via a simple TUI
+- Scriptable headless/CLI mode for automation
 - Lightweight and fast (written in Rust)
 - Direct integration with `gigabyte-laptop-wmi`
 - No background services or daemons required
@@ -24,12 +25,13 @@ See More:
 
 ### Method 1: 🦀 Using Cargo
 
+Since `gigabytectl` needs root, and `sudo` does not use your `PATH`, installing with a plain `cargo install gigabytectl` (which installs to `~/.cargo/bin`) means `sudo gigabytectl` will fail with "command not found". Install straight into `/usr/local`, which is on root's `PATH`, using `--root`:
+
 ```bash
-cargo install gigabytectl
+sudo cargo install gigabytectl --root /usr/local
 ```
 
-> If `gigabytectl` is not found after installation, make sure `~/.cargo/bin` is in your `PATH`.  
-> See the [Cargo PATH Setup](https://github.com/Code-Sapling/gigabytectl#-cargo-path-setup) section below.
+Now `sudo gigabytectl` will work correctly.
 
 
 ### Method 2: 📦 Prebuilt Binary (GitHub Releases)
@@ -76,7 +78,38 @@ You can also run it directly with `sudo`:
 sudo gigabytectl
 ``` 
 
-If you encounter issues (especially when installed using `cargo`), `sudo` may cause path issues. In that case, try running without `sudo` and then choose `y` when prompted, or simply press Enter.
+## ⚙️ Headless / CLI Mode
+
+Running `gigabytectl` with no arguments launches the TUI. Passing a subcommand instead runs a one-shot, scriptable command and exits — no TUI required.
+
+```bash
+sudo gigabytectl status                  # human-readable summary
+sudo gigabytectl status --json           # JSON output
+
+sudo gigabytectl fan-mode get
+sudo gigabytectl fan-mode set gaming      # normal|silent|gaming|custom|auto|fixed
+
+sudo gigabytectl fan-speed get
+sudo gigabytectl fan-speed set 50         # 25..100, step 5
+
+sudo gigabytectl charge-mode get
+sudo gigabytectl charge-mode set custom   # normal|custom
+
+sudo gigabytectl charge-limit get
+sudo gigabytectl charge-limit set 80      # 60..100
+
+sudo gigabytectl gpu-boost get
+sudo gigabytectl gpu-boost set on         # on|off
+
+sudo gigabytectl battery-cycle
+sudo gigabytectl fans                     # live fan RPM readings
+
+sudo gigabytectl fan-curve get            # all 15 points (index temp speed)
+sudo gigabytectl fan-curve get 3          # single point
+sudo gigabytectl fan-curve set 3 40 120   # index temp speed
+```
+
+Run `gigabytectl --help` or `gigabytectl <command> --help` for the full list of commands and options. CLI subcommands require root and exit with a clear error (rather than an interactive prompt) if not run with `sudo`, so they are safe to use in scripts.
 
 ## 🧹 Uninstall
 
@@ -89,7 +122,7 @@ sudo rm /usr/local/bin/gigabytectl
 If installed via Cargo:
 
 ```bash
-cargo uninstall gigabytectl
+sudo cargo uninstall gigabytectl --root /usr/local
 ```
 
 
@@ -98,7 +131,7 @@ cargo uninstall gigabytectl
 ### Method 1: 🦀 Using Cargo
 
 ```bash
-cargo install gigabytectl --force
+sudo cargo install gigabytectl --root /usr/local --force
 ```
 
 ### Method 2: 📦 Prebuilt Binary (GitHub Releases)
@@ -112,23 +145,6 @@ If you installed using a prebuilt binary, simply:
 
 Works on Gigabyte / AORUS laptops using the `gigabyte-laptop-wmi` kernel module.
 > You need the `gigabyte-laptop-wmi` kernel module.
-
-## 🦀 Cargo PATH Setup
-
-Cargo installs binaries to:
-
-```
-~/.cargo/bin
-```
-
-If this directory is not in your `PATH`, you won’t be able to run installed binaries.
-
-To add it, run:
-
-```bash
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
-```
-Then restart your terminal
 
 ## 🤖 AI Usage
 
