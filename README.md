@@ -11,14 +11,17 @@ See More:
 
 ## ✨ Features
 
-- View fan speeds in real time
+- View fan speeds and CPU/GPU temperatures in real time
 - Control fan speed via a simple TUI
-- Scriptable headless/CLI mode for automation
+- Live history graph of temperatures and fan RPM
+- Save and apply configuration profiles
+- Scriptable headless/CLI mode for automation, including a `monitor` mode
+- Shell completions for bash, zsh, and fish
+- Configurable defaults (refresh interval, temperature units)
 - Lightweight and fast (written in Rust)
 - Direct integration with `gigabyte-laptop-wmi`
 - No background services or daemons required
 - Works directly with `/sys` interfaces
-- Minimal dependencies
 - Keyboard-driven interface
 
 ## ⬇️ Installation
@@ -107,9 +110,69 @@ sudo gigabytectl fans                     # live fan RPM readings
 sudo gigabytectl fan-curve get            # all 15 points (index temp speed)
 sudo gigabytectl fan-curve get 3          # single point
 sudo gigabytectl fan-curve set 3 40 120   # index temp speed
+
+gigabytectl monitor                       # live temps + fan RPM (Ctrl-C to stop)
+gigabytectl monitor --interval 2 --json   # custom interval, JSON per line
 ```
 
-Run `gigabytectl --help` or `gigabytectl <command> --help` for the full list of commands and options. CLI subcommands require root and exit with a clear error (rather than an interactive prompt) if not run with `sudo`, so they are safe to use in scripts.
+`monitor`, `completions`, and `profile --list` are read-only and do not require root. The other subcommands read from or write to `/sys` and require `sudo`; they exit with a clear error (rather than an interactive prompt) if not run as root, so they are safe to use in scripts.
+
+Run `gigabytectl --help` or `gigabytectl <command> --help` for the full list of commands and options.
+
+## 🎚️ Profiles
+
+Save a bundle of settings and reapply it later with a single command. Profiles live in `~/.config/gigabytectl/profiles.toml`.
+
+```bash
+sudo gigabytectl profile --save gaming    # snapshot current settings as "gaming"
+gigabytectl profile --list                # list saved profiles
+sudo gigabytectl profile gaming           # apply the "gaming" profile
+```
+
+You can also write profiles by hand. Every field is optional — a profile only changes what it specifies:
+
+```toml
+[gaming]
+fan_mode = "gaming"        # normal|silent|gaming|custom|auto|fixed
+charge_limit = 80          # 60..100
+gpu_boost = "on"           # on|off
+
+[quiet]
+fan_mode = "silent"
+charge_mode = "normal"     # normal|custom
+fan_custom_speed = 30      # 25..100, step 5
+# Optional full 15-point fan curve as [temp, speed] pairs:
+# fan_curve = [[0,0], [40,20], [50,40], [60,80], [70,120], [80,180],
+#              [90,220], [100,255], [100,255], [100,255], [100,255],
+#              [100,255], [100,255], [100,255], [100,255]]
+```
+
+## 🛠️ Configuration
+
+Optional defaults live in `~/.config/gigabytectl/config.toml`. Missing or invalid files fall back to the defaults shown below:
+
+```toml
+refresh_interval_ms = 1000   # TUI auto-refresh and default monitor interval
+units = "celsius"            # celsius|fahrenheit (temperature display)
+history_length = 120         # samples kept in the TUI history graph
+```
+
+> When run under `sudo`, config is resolved from the invoking user's home (via `$SUDO_USER`), not root's, so `~/.config/gigabytectl` is the same whether or not you use `sudo`.
+
+## ⌨️ Shell Completions
+
+Generate completions for your shell and load them:
+
+```bash
+# bash
+gigabytectl completions bash | sudo tee /etc/bash_completion.d/gigabytectl > /dev/null
+
+# zsh
+gigabytectl completions zsh > ~/.zsh/completions/_gigabytectl
+
+# fish
+gigabytectl completions fish > ~/.config/fish/completions/gigabytectl.fish
+```
 
 ## 🧹 Uninstall
 
