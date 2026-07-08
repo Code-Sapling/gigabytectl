@@ -234,6 +234,10 @@ pub struct Profile {
     pub gpu_boost: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_curve: Option<Vec<[i32; 2]>>,
+    /// power-profiles-daemon profile this maps to (e.g. "performance",
+    /// "balanced", "power-saver"). Used for two-way sync with PPD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ppd_profile: Option<String>,
 }
 
 fn fan_mode_value(name: &str) -> Result<i32> {
@@ -333,6 +337,7 @@ fn current_profile() -> Profile {
         charge_limit: read_i32(CHARGE_LIMIT),
         gpu_boost: read_i32(GPU_BOOST).map(|v| if v == 1 { "on".to_string() } else { "off".to_string() }),
         fan_curve: read_fan_curve().ok().map(|c| c.into_iter().map(|(t, s)| [t, s]).collect()),
+        ppd_profile: ppd_get().ok(),
     }
 }
 
@@ -362,6 +367,105 @@ fn apply_profile(profile: &Profile) -> Result<()> {
             validate_curve_speed(point[1])?;
             write_fan_curve_point(idx, point[0], point[1])?;
         }
+    }
+    Ok(())
+}
+
+// --- power-profiles-daemon (PPD) integration ---
+
+/// Candidate D-Bus (bus name, object path) pairs for power-profiles-daemon. The
+/// interface name matches the bus name in both cases. Newer builds may live under
+/// the UPower namespace, older ones under net.hadess, so we probe each in order.
+const PPD_ENDPOINTS: [(&str, &str); 2] = [
+    ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles"),
+    ("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles"),
+];
+
+/// Returns the first PPD (bus name, object path) whose `ActiveProfile` can be
+/// read, or `None` if power-profiles-daemon is not reachable on the system bus.
+fn ppd_endpoint() -> Option<(&'static str, &'static str)> {
+    for &(dest, path) in &PPD_ENDPOINTS {
+        let ok = Command::new("busctl")
+            .args(["--system", "get-property", dest, path, dest, "ActiveProfile"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some((dest, path));
+        }
+    }
+    None
+}
+
+/// Parses a `busctl get-property` scalar-string line (`s "balanced"`) into its
+/// inner value.
+fn parse_busctl_string(out: &str) -> Option<String> {
+    let rest = out.trim().strip_prefix("s ")?;
+    Some(rest.trim().trim_matches('"').to_string())
+}
+
+/// Reads the currently-active PPD profile (e.g. "balanced").
+fn ppd_get() -> Result<String> {
+    let (dest, path) = ppd_endpoint().context("power-profiles-daemon is not available on the system bus")?;
+    let out = Command::new("busctl")
+        .args(["--system", "get-property", dest, path, dest, "ActiveProfile"])
+        .output()
+        .context("running busctl to read ActiveProfile")?;
+    anyhow::ensure!(out.status.success(), "busctl get-property failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_busctl_string(&text).with_context(|| format!("parsing PPD ActiveProfile from {:?}", text))
+}
+
+/// Sets the active PPD profile. Setting it to its current value is a no-op, so
+/// this is safe to call from the sync daemon without causing feedback loops.
+fn ppd_set(profile: &str) -> Result<()> {
+    let (dest, path) = ppd_endpoint().context("power-profiles-daemon is not available on the system bus")?;
+    let out = Command::new("busctl")
+        .args(["--system", "set-property", dest, path, dest, "ActiveProfile", "s", profile])
+        .output()
+        .context("running busctl to set ActiveProfile")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "setting power profile '{}' failed: {}",
+        profile,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Finds the saved profile mapped to the given PPD profile. If several profiles
+/// map to the same PPD profile, the alphabetically-first name wins so the choice
+/// is deterministic.
+fn profile_for_ppd<'a>(profiles: &'a HashMap<String, Profile>, ppd: &str) -> Option<(&'a String, &'a Profile)> {
+    let mut matches: Vec<(&String, &Profile)> = profiles
+        .iter()
+        .filter(|(_, p)| p.ppd_profile.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(ppd)))
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(b.0));
+    matches.into_iter().next()
+}
+
+/// Extracts the new profile name from a `gdbus monitor` PropertiesChanged line
+/// of the form `... {'ActiveProfile': <'performance'>} ...`.
+fn parse_active_profile_change(line: &str) -> Option<String> {
+    let key = "'ActiveProfile': <'";
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// Applies the gigabytectl profile mapped to the currently-active PPD profile
+/// (hardware only — it deliberately does not touch PPD).
+fn apply_ppd_mapping() -> Result<()> {
+    let current = ppd_get()?;
+    let profiles = load_profiles()?;
+    match profile_for_ppd(&profiles, &current) {
+        Some((name, profile)) => {
+            apply_profile(profile)?;
+            eprintln!("Power profile '{}' -> applied gigabytectl profile '{}'", current, name);
+        }
+        None => eprintln!("Power profile '{}' has no mapped gigabytectl profile; nothing to apply", current),
     }
     Ok(())
 }
@@ -691,6 +795,13 @@ enum Commands {
     },
     /// Apply, list, or save profiles (~/.config/gigabytectl/profiles.toml)
     Profile(ProfileArgs),
+    /// Sync with power-profiles-daemon: apply the mapped profile whenever the
+    /// system power profile changes. Runs until interrupted (for a systemd service).
+    Sync {
+        /// Apply the profile mapped to the current power profile once, then exit
+        #[arg(long)]
+        once: bool,
+    },
     /// Generate shell completions (bash, zsh, fish, ...)
     Completions {
         /// Shell to generate completions for
@@ -801,6 +912,7 @@ fn run_cli(command: Commands, config: &Config) -> Result<()> {
         Commands::Completions { shell } => return run_completions(*shell),
         Commands::Monitor { interval, json } => return run_monitor(*interval, *json, config),
         Commands::Profile(args) => return run_profile(args, config),
+        Commands::Sync { once } => return run_sync(*once),
         _ => {}
     }
 
@@ -878,7 +990,7 @@ fn run_cli(command: Commands, config: &Config) -> Result<()> {
                 write_fan_curve_point(index, temp, speed)?;
             }
         },
-        Commands::Monitor { .. } | Commands::Profile(_) | Commands::Completions { .. } => unreachable!(),
+        Commands::Monitor { .. } | Commands::Profile(_) | Commands::Sync { .. } | Commands::Completions { .. } => unreachable!(),
     }
 
     Ok(())
@@ -964,7 +1076,59 @@ fn run_profile(args: &ProfileArgs, _config: &Config) -> Result<()> {
         .with_context(|| format!("profile '{}' not found in {}", name, config_dir().join("profiles.toml").display()))?;
     apply_profile(profile)?;
     println!("Applied profile '{}'", name);
+
+    // Forward sync: if this profile maps to a PPD profile, switch PPD to match.
+    if let Some(ppd) = &profile.ppd_profile {
+        match ppd_set(ppd) {
+            Ok(()) => println!("Set power profile -> {}", ppd),
+            Err(e) => eprintln!("Warning: {}", e),
+        }
+    }
     Ok(())
+}
+
+fn run_sync(once: bool) -> Result<()> {
+    require_ready_for_cli()?;
+    anyhow::ensure!(
+        ppd_endpoint().is_some(),
+        "power-profiles-daemon is not available on the system bus (is it installed and running?)"
+    );
+
+    // Apply the mapping for whatever profile is active right now.
+    apply_ppd_mapping()?;
+    if once {
+        return Ok(());
+    }
+
+    let (dest, path) = ppd_endpoint().context("power-profiles-daemon disappeared")?;
+    eprintln!("gigabytectl: watching {} for power profile changes (Ctrl-C to stop)...", dest);
+
+    let mut child = Command::new("gdbus")
+        .args(["monitor", "--system", "--dest", dest, "--object-path", path])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning `gdbus monitor` (is gdbus/glib2 installed?)")?;
+
+    let stdout = child.stdout.take().context("capturing gdbus stdout")?;
+    let reader = io::BufReader::new(stdout);
+    use std::io::BufRead;
+    for line in reader.lines() {
+        let line = line.context("reading gdbus monitor output")?;
+        let Some(profile) = parse_active_profile_change(&line) else {
+            continue;
+        };
+        let profiles = load_profiles()?;
+        match profile_for_ppd(&profiles, &profile) {
+            Some((name, p)) => match apply_profile(p) {
+                Ok(()) => eprintln!("Power profile '{}' -> applied gigabytectl profile '{}'", profile, name),
+                Err(e) => eprintln!("Warning: failed to apply gigabytectl profile '{}': {}", name, e),
+            },
+            None => eprintln!("Power profile '{}' has no mapped gigabytectl profile; ignoring", profile),
+        }
+    }
+
+    let status = child.wait().context("waiting on gdbus monitor")?;
+    anyhow::bail!("gdbus monitor exited unexpectedly ({})", status);
 }
 
 fn print_status(json: bool, units: Units) {
