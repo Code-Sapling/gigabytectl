@@ -1,6 +1,7 @@
 // src/main.rs
 
 use std::{
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, Stdout},
     os::unix::fs::MetadataExt,
@@ -10,7 +11,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Args, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
+use serde::{Deserialize, Serialize};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     execute,
@@ -115,6 +118,296 @@ impl GigabyteHwmon {
     }
 }
 
+// --- Temperature Sensors ---
+
+fn read_i32_at(path: &Path) -> Option<i32> {
+    fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<i32>().ok())
+}
+
+/// Reads `temp1_input` (millidegrees C) from the first `/sys/class/hwmon` device
+/// whose `name` matches one of `names`, returning degrees Celsius.
+fn hwmon_temp(names: &[&str]) -> Option<f32> {
+    let base = "/sys/class/hwmon";
+    for entry in fs::read_dir(base).ok()?.flatten() {
+        let path = entry.path();
+        let Ok(name) = fs::read_to_string(path.join("name")) else {
+            continue;
+        };
+        if names.contains(&name.trim())
+            && let Some(milli) = read_i32_at(&path.join("temp1_input"))
+        {
+            return Some(milli as f32 / 1000.0);
+        }
+    }
+    None
+}
+
+/// Best-effort GPU temperature via the NVIDIA proprietary driver.
+fn nvidia_temp() -> Option<f32> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<f32>().ok())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Temps {
+    pub cpu: Option<f32>,
+    pub gpu: Option<f32>,
+}
+
+impl Temps {
+    fn read() -> Self {
+        let cpu = hwmon_temp(&["coretemp", "k10temp", "zenpower"]);
+        let gpu = hwmon_temp(&["amdgpu", "nouveau"]).or_else(nvidia_temp);
+        Self { cpu, gpu }
+    }
+}
+
+// --- Config & Profiles ---
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Units {
+    #[default]
+    Celsius,
+    Fahrenheit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// TUI auto-refresh interval in milliseconds (also the default for `monitor`).
+    pub refresh_interval_ms: u64,
+    /// Temperature unit used for display.
+    pub units: Units,
+    /// Number of samples kept in the TUI history graph.
+    pub history_length: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            refresh_interval_ms: 1000,
+            units: Units::Celsius,
+            history_length: 120,
+        }
+    }
+}
+
+impl Config {
+    fn load() -> Self {
+        let path = config_dir().join("config.toml");
+        match fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("Warning: failed to parse {}: {}. Using defaults.", path.display(), e);
+                    Config::default()
+                }
+            },
+            Err(_) => Config::default(),
+        }
+    }
+}
+
+/// A saved snapshot of controllable values. All fields optional so a profile can
+/// set only what it cares about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Profile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_custom_speed: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_limit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_boost: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_curve: Option<Vec<[i32; 2]>>,
+}
+
+fn fan_mode_value(name: &str) -> Result<i32> {
+    match name.to_ascii_lowercase().as_str() {
+        "normal" => Ok(0),
+        "silent" => Ok(1),
+        "gaming" => Ok(2),
+        "custom" => Ok(3),
+        "auto" => Ok(4),
+        "fixed" => Ok(5),
+        other => Err(anyhow::anyhow!("Unknown fan mode '{}'", other)),
+    }
+}
+
+fn charge_mode_value(name: &str) -> Result<i32> {
+    match name.to_ascii_lowercase().as_str() {
+        "normal" => Ok(0),
+        "custom" => Ok(1),
+        other => Err(anyhow::anyhow!("Unknown charge mode '{}'", other)),
+    }
+}
+
+fn on_off_value(name: &str) -> Result<i32> {
+    match name.to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" => Ok(1),
+        "off" | "0" | "false" => Ok(0),
+        other => Err(anyhow::anyhow!("Expected on/off, got '{}'", other)),
+    }
+}
+
+/// Resolves the config directory, accounting for being run under `sudo`.
+/// Prefers the invoking user's home (via `$SUDO_USER`) so config lives in the
+/// real user's `~/.config`, not root's.
+fn config_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("gigabytectl");
+    }
+    let home = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .and_then(|user| home_of_user(&user))
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "/root".to_string());
+    PathBuf::from(home).join(".config").join("gigabytectl")
+}
+
+/// Looks up a user's home directory from the passwd database.
+fn home_of_user(user: &str) -> Option<String> {
+    let output = Command::new("getent").args(["passwd", user]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    line.split(':').nth(5).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn load_profiles() -> Result<HashMap<String, Profile>> {
+    let path = config_dir().join("profiles.toml");
+    match fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+        Err(_) => Ok(HashMap::new()),
+    }
+}
+
+fn save_profiles(profiles: &HashMap<String, Profile>) -> Result<()> {
+    let dir = config_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("profiles.toml");
+    let text = toml::to_string_pretty(profiles).context("serializing profiles")?;
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    chown_to_sudo_user(&dir);
+    Ok(())
+}
+
+/// When run under sudo, hand ownership of freshly-written config back to the
+/// invoking user so they can edit it without root. Best-effort.
+fn chown_to_sudo_user(dir: &Path) {
+    if let Ok(user) = std::env::var("SUDO_USER")
+        && !user.is_empty()
+    {
+        let _ = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{}:", user))
+            .arg(dir)
+            .status();
+    }
+}
+
+/// Reads the current hardware state into a Profile (for `profile save`).
+fn current_profile() -> Profile {
+    Profile {
+        fan_mode: Some(fan_mode_name(read_i32(FAN_MODE)).to_lowercase()),
+        fan_custom_speed: read_i32(FAN_CUSTOM_SPEED),
+        charge_mode: Some(charge_mode_name(read_i32(CHARGE_MODE)).to_lowercase()),
+        charge_limit: read_i32(CHARGE_LIMIT),
+        gpu_boost: read_i32(GPU_BOOST).map(|v| if v == 1 { "on".to_string() } else { "off".to_string() }),
+        fan_curve: read_fan_curve().ok().map(|c| c.into_iter().map(|(t, s)| [t, s]).collect()),
+    }
+}
+
+/// Applies a profile's settings to the hardware, validating each field.
+fn apply_profile(profile: &Profile) -> Result<()> {
+    if let Some(mode) = &profile.fan_mode {
+        write_value(FAN_MODE, fan_mode_value(mode)?)?;
+    }
+    if let Some(speed) = profile.fan_custom_speed {
+        validate_fan_speed(speed)?;
+        write_value(FAN_CUSTOM_SPEED, speed)?;
+    }
+    if let Some(mode) = &profile.charge_mode {
+        write_value(CHARGE_MODE, charge_mode_value(mode)?)?;
+    }
+    if let Some(limit) = profile.charge_limit {
+        validate_charge_limit(limit)?;
+        write_value(CHARGE_LIMIT, limit)?;
+    }
+    if let Some(boost) = &profile.gpu_boost {
+        write_value(GPU_BOOST, on_off_value(boost)?)?;
+    }
+    if let Some(curve) = &profile.fan_curve {
+        anyhow::ensure!(curve.len() == FAN_CURVE_POINTS, "Fan curve must have {} points", FAN_CURVE_POINTS);
+        for (idx, point) in curve.iter().enumerate() {
+            validate_curve_temp(point[0])?;
+            validate_curve_speed(point[1])?;
+            write_fan_curve_point(idx, point[0], point[1])?;
+        }
+    }
+    Ok(())
+}
+
+// --- History (rolling samples for the TUI graph) ---
+
+struct History {
+    start: Instant,
+    cpu: VecDeque<(f64, f64)>,
+    gpu: VecDeque<(f64, f64)>,
+    rpm: VecDeque<(f64, f64)>,
+    max_len: usize,
+}
+
+impl History {
+    fn new(max_len: usize) -> Self {
+        Self {
+            start: Instant::now(),
+            cpu: VecDeque::new(),
+            gpu: VecDeque::new(),
+            rpm: VecDeque::new(),
+            max_len: max_len.max(2),
+        }
+    }
+
+    fn push(&mut self, temps: Temps, fans: &[Fan]) {
+        let t = self.start.elapsed().as_secs_f64();
+        if let Some(c) = temps.cpu {
+            push_capped(&mut self.cpu, (t, c as f64), self.max_len);
+        }
+        if let Some(g) = temps.gpu {
+            push_capped(&mut self.gpu, (t, g as f64), self.max_len);
+        }
+        if let Some(max_rpm) = fans.iter().map(|f| f.rpm).max() {
+            push_capped(&mut self.rpm, (t, max_rpm as f64), self.max_len);
+        }
+    }
+}
+
+fn push_capped(buf: &mut VecDeque<(f64, f64)>, point: (f64, f64), max_len: usize) {
+    buf.push_back(point);
+    while buf.len() > max_len {
+        buf.pop_front();
+    }
+}
+
 // --- App State ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +418,8 @@ enum Item {
     ChargeLimit,
     GpuBoost,
     FanCurveView,
-    FanCurveEdit,  
+    FanCurveEdit,
+    History,
     Refresh,
     Quit,
 }
@@ -166,12 +460,17 @@ struct App {
 
     hwmon: Option<GigabyteHwmon>,
     live_fans: Vec<Fan>,
+    temps: Temps,
+
+    config: Config,
+    history: History,
 
     last_refresh: Instant,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(config: Config) -> Self {
+        let history = History::new(config.history_length);
         Self {
             items: &[
                 Item::FanMode,
@@ -181,6 +480,7 @@ impl App {
                 Item::GpuBoost,
                 Item::FanCurveView,
                 Item::FanCurveEdit,
+                Item::History,
                 Item::Refresh,
                 Item::Quit,
             ],
@@ -200,6 +500,9 @@ impl App {
             fan_curve_col: 0,
             hwmon: GigabyteHwmon::new(),
             live_fans: Vec::new(),
+            temps: Temps::default(),
+            config,
+            history,
             last_refresh: Instant::now(),
         }
     }
@@ -216,6 +519,8 @@ impl App {
         if let Some(hwmon) = &self.hwmon {
             self.live_fans = hwmon.read_fans();
         }
+        self.temps = Temps::read();
+        self.history.push(self.temps, &self.live_fans);
 
         self.last_refresh = Instant::now();
     }
@@ -375,6 +680,34 @@ enum Commands {
         #[command(subcommand)]
         action: FanCurveAction,
     },
+    /// Continuously print temps and fan RPM (Ctrl-C to stop)
+    Monitor {
+        /// Refresh interval in seconds (defaults to config refresh_interval_ms)
+        #[arg(short, long)]
+        interval: Option<f64>,
+        /// Output as JSON, one object per line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply, list, or save profiles (~/.config/gigabytectl/profiles.toml)
+    Profile(ProfileArgs),
+    /// Generate shell completions (bash, zsh, fish, ...)
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
+}
+
+#[derive(Args)]
+struct ProfileArgs {
+    /// Name of the profile to apply
+    name: Option<String>,
+    /// List available profiles
+    #[arg(short, long)]
+    list: bool,
+    /// Save the current hardware settings as a new profile with this name
+    #[arg(long, value_name = "NAME")]
+    save: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -461,11 +794,20 @@ fn require_ready_for_cli() -> Result<()> {
     Ok(())
 }
 
-fn run_cli(command: Commands) -> Result<()> {
+fn run_cli(command: Commands, config: &Config) -> Result<()> {
+    // These commands are read-only or touch only user config, so they don't
+    // require root or the driver to be present.
+    match &command {
+        Commands::Completions { shell } => return run_completions(*shell),
+        Commands::Monitor { interval, json } => return run_monitor(*interval, *json, config),
+        Commands::Profile(args) => return run_profile(args, config),
+        _ => {}
+    }
+
     require_ready_for_cli()?;
 
     match command {
-        Commands::Status { json } => print_status(json),
+        Commands::Status { json } => print_status(json, config.units),
         Commands::FanMode { action } => match action {
             FanModeAction::Get => println!("{}", fan_mode_name(read_i32(FAN_MODE)).to_lowercase()),
             FanModeAction::Set { mode } => write_value(FAN_MODE, mode.as_i32())?,
@@ -536,18 +878,103 @@ fn run_cli(command: Commands) -> Result<()> {
                 write_fan_curve_point(index, temp, speed)?;
             }
         },
+        Commands::Monitor { .. } | Commands::Profile(_) | Commands::Completions { .. } => unreachable!(),
     }
 
     Ok(())
 }
 
-fn print_status(json: bool) {
+fn run_completions(shell: Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    generate(shell, &mut cmd, name, &mut io::stdout());
+    Ok(())
+}
+
+fn run_monitor(interval: Option<f64>, json: bool, config: &Config) -> Result<()> {
+    let secs = interval.unwrap_or(config.refresh_interval_ms as f64 / 1000.0).max(0.1);
+    let period = Duration::from_secs_f64(secs);
+    let units = config.units;
+
+    loop {
+        let temps = Temps::read();
+        let fans = GigabyteHwmon::new().map(|h| h.read_fans()).unwrap_or_default();
+
+        if json {
+            let fans_json: Vec<String> = fans
+                .iter()
+                .map(|f| format!(r#"{{"name":"{}","rpm":{}}}"#, json_escape(&f.name), f.rpm))
+                .collect();
+            println!(
+                r#"{{"cpu_temp":{},"gpu_temp":{},"fans":[{}]}}"#,
+                temps.cpu.map(|c| format!("{:.1}", to_units(c, units))).unwrap_or_else(|| "null".to_string()),
+                temps.gpu.map(|g| format!("{:.1}", to_units(g, units))).unwrap_or_else(|| "null".to_string()),
+                fans_json.join(",")
+            );
+        } else {
+            let fan_str: String = if fans.is_empty() {
+                "no fan data".to_string()
+            } else {
+                fans.iter().map(|f| format!("{}: {} RPM", f.name, f.rpm)).collect::<Vec<_>>().join("   ")
+            };
+            println!(
+                "CPU {}   GPU {}   {}",
+                format_temp(temps.cpu, units),
+                format_temp(temps.gpu, units),
+                fan_str
+            );
+        }
+
+        std::thread::sleep(period);
+    }
+}
+
+fn run_profile(args: &ProfileArgs, _config: &Config) -> Result<()> {
+    if let Some(name) = &args.save {
+        anyhow::ensure!(is_root(), "gigabytectl: saving a profile reads hardware state; run as root (try: sudo gigabytectl profile --save {})", name);
+        let mut profiles = load_profiles()?;
+        profiles.insert(name.clone(), current_profile());
+        save_profiles(&profiles)?;
+        println!("Saved profile '{}'", name);
+        return Ok(());
+    }
+
+    if args.list {
+        let profiles = load_profiles()?;
+        if profiles.is_empty() {
+            println!("No profiles defined in {}", config_dir().join("profiles.toml").display());
+        } else {
+            let mut names: Vec<&String> = profiles.keys().collect();
+            names.sort();
+            for name in names {
+                println!("{}", name);
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(name) = &args.name else {
+        anyhow::bail!("Specify a profile to apply, or use --list / --save <name>");
+    };
+
+    require_ready_for_cli()?;
+    let profiles = load_profiles()?;
+    let profile = profiles
+        .get(name)
+        .with_context(|| format!("profile '{}' not found in {}", name, config_dir().join("profiles.toml").display()))?;
+    apply_profile(profile)?;
+    println!("Applied profile '{}'", name);
+    Ok(())
+}
+
+fn print_status(json: bool, units: Units) {
     let fan_mode = fan_mode_name(read_i32(FAN_MODE));
     let fan_speed = value_or_na(read_i32(FAN_CUSTOM_SPEED));
     let charge_mode = charge_mode_name(read_i32(CHARGE_MODE));
     let charge_limit = value_or_na(read_i32(CHARGE_LIMIT));
     let gpu_boost = gpu_boost_name(read_i32(GPU_BOOST));
     let battery_cycle = battery_cycle_text(read_trimmed(BATTERY_CYCLE));
+    let temps = Temps::read();
     let fans = GigabyteHwmon::new().map(|h| h.read_fans()).unwrap_or_default();
 
     if json {
@@ -556,13 +983,15 @@ fn print_status(json: bool) {
             .map(|f| format!(r#"{{"name":"{}","rpm":{}}}"#, json_escape(&f.name), f.rpm))
             .collect();
         println!(
-            r#"{{"fan_mode":"{}","fan_speed":"{}","charge_mode":"{}","charge_limit":"{}","gpu_boost":"{}","battery_cycle":"{}","fans":[{}]}}"#,
+            r#"{{"fan_mode":"{}","fan_speed":"{}","charge_mode":"{}","charge_limit":"{}","gpu_boost":"{}","battery_cycle":"{}","cpu_temp":{},"gpu_temp":{},"fans":[{}]}}"#,
             json_escape(&fan_mode.to_lowercase()),
             json_escape(&fan_speed),
             json_escape(&charge_mode.to_lowercase()),
             json_escape(&charge_limit),
             json_escape(&gpu_boost.to_lowercase()),
             json_escape(&battery_cycle),
+            temps.cpu.map(|c| format!("{:.1}", to_units(c, units))).unwrap_or_else(|| "null".to_string()),
+            temps.gpu.map(|g| format!("{:.1}", to_units(g, units))).unwrap_or_else(|| "null".to_string()),
             fans_json.join(",")
         );
     } else {
@@ -572,6 +1001,8 @@ fn print_status(json: bool) {
         println!("Charge limit:  {}", charge_limit);
         println!("GPU boost:     {}", gpu_boost);
         println!("Battery cycle: {}", battery_cycle);
+        println!("CPU temp:      {}", format_temp(temps.cpu, units));
+        println!("GPU temp:      {}", format_temp(temps.gpu, units));
         if !fans.is_empty() {
             println!("Fans:");
             for fan in fans {
@@ -691,6 +1122,27 @@ fn value_or_na(v: Option<i32>) -> String {
     v.map(|n| n.to_string()).unwrap_or_else(|| "N/A".to_string())
 }
 
+fn to_units(celsius: f32, units: Units) -> f32 {
+    match units {
+        Units::Celsius => celsius,
+        Units::Fahrenheit => celsius * 9.0 / 5.0 + 32.0,
+    }
+}
+
+fn unit_symbol(units: Units) -> &'static str {
+    match units {
+        Units::Celsius => "°C",
+        Units::Fahrenheit => "°F",
+    }
+}
+
+fn format_temp(celsius: Option<f32>, units: Units) -> String {
+    match celsius {
+        Some(c) => format!("{:.0}{}", to_units(c, units), unit_symbol(units)),
+        None => "N/A".to_string(),
+    }
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -761,6 +1213,94 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 // --- UI Components ---
 
+/// Computes [x, y] bounds spanning every point in the given datasets.
+fn xy_bounds(datasets: &[&[(f64, f64)]]) -> Option<([f64; 2], [f64; 2])> {
+    let (mut xmin, mut xmax) = (f64::MAX, f64::MIN);
+    let (mut ymin, mut ymax) = (f64::MAX, f64::MIN);
+    let mut any = false;
+    for data in datasets {
+        for &(x, y) in *data {
+            any = true;
+            xmin = xmin.min(x);
+            xmax = xmax.max(x);
+            ymin = ymin.min(y);
+            ymax = ymax.max(y);
+        }
+    }
+    any.then_some(([xmin, xmax], [ymin, ymax]))
+}
+
+fn time_labels(x: [f64; 2]) -> Vec<Span<'static>> {
+    let mid = (x[0] + x[1]) / 2.0;
+    vec![
+        Span::raw(format!("{:.0}s", x[0])),
+        Span::raw(format!("{:.0}s", mid)),
+        Span::raw(format!("{:.0}s", x[1])),
+    ]
+}
+
+fn value_labels(y: [f64; 2], suffix: &str) -> Vec<Span<'static>> {
+    let mid = (y[0] + y[1]) / 2.0;
+    vec![
+        Span::raw(format!("{:.0}{}", y[0], suffix)),
+        Span::raw(format!("{:.0}{}", mid, suffix)),
+        Span::raw(format!("{:.0}{}", y[1], suffix)),
+    ]
+}
+
+fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, history: &History, units: Units) {
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // --- Temperature chart (CPU + GPU) ---
+    let cpu: Vec<(f64, f64)> = history.cpu.iter().map(|&(t, v)| (t, to_units(v as f32, units) as f64)).collect();
+    let gpu: Vec<(f64, f64)> = history.gpu.iter().map(|&(t, v)| (t, to_units(v as f32, units) as f64)).collect();
+
+    let temp_title = format!("Temperature ({})", unit_symbol(units).trim_start_matches('°'));
+    if let Some((xb, yb)) = xy_bounds(&[&cpu, &gpu]) {
+        let pad = ((yb[1] - yb[0]) * 0.1).max(2.0);
+        let yb = [(yb[0] - pad).max(0.0), yb[1] + pad];
+        let datasets = vec![
+            Dataset::default().name("CPU").marker(symbols::Marker::Braille).graph_type(GraphType::Line).style(Style::default().fg(Color::LightRed)).data(&cpu),
+            Dataset::default().name("GPU").marker(symbols::Marker::Braille).graph_type(GraphType::Line).style(Style::default().fg(Color::Green)).data(&gpu),
+        ];
+        let chart = Chart::new(datasets)
+            .block(Block::default().borders(Borders::ALL).title(temp_title))
+            .x_axis(Axis::default().style(Style::default().fg(Color::Gray)).bounds(xb).labels(time_labels(xb)))
+            .y_axis(Axis::default().style(Style::default().fg(Color::Gray)).bounds(yb).labels(value_labels(yb, unit_symbol(units))));
+        frame.render_widget(chart, halves[0]);
+    } else {
+        frame.render_widget(
+            Paragraph::new("Collecting temperature samples...").block(Block::default().borders(Borders::ALL).title(temp_title)),
+            halves[0],
+        );
+    }
+
+    // --- Fan RPM chart ---
+    let rpm: Vec<(f64, f64)> = history.rpm.iter().copied().collect();
+    if let Some((xb, mut yb)) = xy_bounds(&[&rpm]) {
+        yb = [0.0, yb[1] * 1.1 + 1.0];
+        let datasets = vec![Dataset::default()
+            .name("Fan RPM")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&rpm)];
+        let chart = Chart::new(datasets)
+            .block(Block::default().borders(Borders::ALL).title("Fan RPM (max)"))
+            .x_axis(Axis::default().style(Style::default().fg(Color::Gray)).bounds(xb).labels(time_labels(xb)))
+            .y_axis(Axis::default().style(Style::default().fg(Color::Gray)).bounds(yb).labels(value_labels(yb, "")));
+        frame.render_widget(chart, halves[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new("Collecting fan samples...").block(Block::default().borders(Borders::ALL).title("Fan RPM (max)")),
+            halves[1],
+        );
+    }
+}
+
 fn item_title(item: Item) -> &'static str {
     match item {
         Item::FanMode => "Fan mode",
@@ -769,7 +1309,8 @@ fn item_title(item: Item) -> &'static str {
         Item::ChargeLimit => "Charging limit",
         Item::GpuBoost => "GPU boost",
         Item::FanCurveView => "Fan curve (View)",
-        Item::FanCurveEdit => "Fan curve (Edit)",      
+        Item::FanCurveEdit => "Fan curve (Edit)",
+        Item::History => "History graph",
         Item::Refresh => "Refresh values",
         Item::Quit => "Quit",
     }
@@ -783,7 +1324,8 @@ fn item_hint(item: Item) -> &'static str {
         Item::ChargeLimit => "Enter 60..100",
         Item::GpuBoost => "Left/Right toggles ON/OFF",
         Item::FanCurveView => "Shows a visual graph of the current fan curve",
-        Item::FanCurveEdit => "Press Enter to edit the fan curve table",      
+        Item::FanCurveEdit => "Press Enter to edit the fan curve table",
+        Item::History => "Live CPU/GPU temperature and fan RPM over time",
         Item::Refresh => "Reload all sysfs nodes",
         Item::Quit => "Exit the app",
     }
@@ -934,6 +1476,9 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .block(Block::default().borders(Borders::ALL).title("Fan Curve Graph"));
             frame.render_widget(fc_widget, right[0]);
         }
+    } else if selected == Item::History {
+        // --- HISTORY MODE (Live temp + RPM charts) ---
+        render_history(frame, right[0], &app.history, app.config.units);
     } else if app.focus == Focus::FanCurveList || selected == Item::FanCurveEdit {
         // --- 2. EDIT MODE (Interactive Table) ---
         let mut lines = vec![];
@@ -995,6 +1540,14 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
             Line::from(vec![
                 Span::styled("Battery cycle  ", Style::default().fg(Color::White)),
                 Span::styled(battery_cycle_text(app.battery_cycle.clone()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("CPU temp       ", Style::default().fg(Color::White)),
+                Span::styled(format_temp(app.temps.cpu, app.config.units), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("GPU temp       ", Style::default().fg(Color::White)),
+                Span::styled(format_temp(app.temps.gpu, app.config.units), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ]),
         ];
 
@@ -1147,6 +1700,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             Item::GpuBoost => app.toggle_gpu_boost(),
             Item::FanCurveEdit => app.focus = Focus::FanCurveList,
             Item::FanCurveView => {},
+            Item::History => {},
             Item::Refresh => {
                 app.refresh();
                 app.set_status("Refreshed values");
@@ -1192,13 +1746,14 @@ fn install_panic_hook() {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = Config::load();
     match cli.command {
-        Some(command) => run_cli(command),
-        None => run_tui(),
+        Some(command) => run_cli(command, &config),
+        None => run_tui(config),
     }
 }
 
-fn run_tui() -> Result<()> {
+fn run_tui(config: Config) -> Result<()> {
     if !is_root() {
         println!("This program requires root privileges.");
         print!("Do you want to run with sudo? [Y/n]: ");
@@ -1225,8 +1780,9 @@ fn run_tui() -> Result<()> {
     }
 
     install_panic_hook();
+    let refresh_interval = Duration::from_millis(config.refresh_interval_ms.max(100));
     let mut terminal = setup_terminal()?;
-    let mut app = App::new();
+    let mut app = App::new(config);
     app.refresh();
 
     let tick_rate = Duration::from_millis(250);
@@ -1234,8 +1790,8 @@ fn run_tui() -> Result<()> {
 
     let run = (|| -> Result<()> {
         loop {
-            // Auto-refresh every 1 second
-            if app.last_refresh.elapsed() >= Duration::from_secs(1) {
+            // Auto-refresh at the configured interval
+            if app.last_refresh.elapsed() >= refresh_interval {
                 app.refresh();
             }
 
