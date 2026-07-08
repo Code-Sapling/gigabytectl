@@ -1,0 +1,35 @@
+name: Release
+
+# Runs when you push a version tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required for creating the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        run: |
+          tarball="gigabytectl-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -czf "$tarball" -C target/release gigabytectl
+          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TARBALL }}
+          generate_release_notes: true
