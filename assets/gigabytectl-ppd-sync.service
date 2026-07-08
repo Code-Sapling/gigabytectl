@@ -1,0 +1,16 @@
+[Unit]
+Description=gigabytectl power-profiles-daemon sync
+Documentation=https://github.com/Code-Sapling/gigabytectl
+# Apply the mapped gigabytectl profile whenever the system power profile changes.
+After=power-profiles-daemon.service
+Wants=power-profiles-daemon.service
+
+[Service]
+Type=simple
+# Adjust the path if you installed elsewhere (e.g. /usr/bin/gigabytectl).
+ExecStart=/usr/local/bin/gigabytectl sync
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

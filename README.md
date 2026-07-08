@@ -20,7 +20,7 @@ See More:
 - Configurable defaults (refresh interval, temperature units)
 - Lightweight and fast (written in Rust)
 - Direct integration with `gigabyte-laptop-wmi`
-- No background services or daemons required
+- Optional two-way sync with `power-profiles-daemon`
 - Works directly with `/sys` interfaces
 - Keyboard-driven interface
 
@@ -113,6 +113,9 @@ sudo gigabytectl fan-curve set 3 40 120   # index temp speed
 
 gigabytectl monitor                       # live temps + fan RPM (Ctrl-C to stop)
 gigabytectl monitor --interval 2 --json   # custom interval, JSON per line
+
+sudo gigabytectl sync --once              # apply profile mapped to current power profile
+sudo gigabytectl sync                     # watch power-profiles-daemon and sync (see below)
 ```
 
 `monitor`, `completions`, and `profile --list` are read-only and do not require root. The other subcommands read from or write to `/sys` and require `sudo`; they exit with a clear error (rather than an interactive prompt) if not run as root, so they are safe to use in scripts.
@@ -136,11 +139,13 @@ You can also write profiles by hand. Every field is optional — a profile only 
 fan_mode = "gaming"        # normal|silent|gaming|custom|auto|fixed
 charge_limit = 80          # 60..100
 gpu_boost = "on"           # on|off
+ppd_profile = "performance" # optional: power-profiles-daemon profile (see below)
 
 [quiet]
 fan_mode = "silent"
 charge_mode = "normal"     # normal|custom
 fan_custom_speed = 30      # 25..100, step 5
+ppd_profile = "power-saver"
 # Optional full 15-point fan curve as [temp, speed] pairs:
 # fan_curve = [[0,0], [40,20], [50,40], [60,80], [70,120], [80,180],
 #              [90,220], [100,255], [100,255], [100,255], [100,255],
@@ -158,6 +163,44 @@ history_length = 120         # samples kept in the TUI history graph
 ```
 
 > When run under `sudo`, config is resolved from the invoking user's home (via `$SUDO_USER`), not root's, so `~/.config/gigabytectl` is the same whether or not you use `sudo`.
+
+## 🔋 Power Profiles Daemon Sync
+
+If you run [`power-profiles-daemon`](https://gitlab.freedesktop.org/upower/power-profiles-daemon) (the default on GNOME/KDE, driving the Balanced/Performance/Power Saver toggle), gigabytectl can keep the two in sync **both ways**.
+
+Give a profile a `ppd_profile` field to link it to a PPD profile (`power-saver`, `balanced`, or `performance`). That one field defines the mapping in both directions:
+
+```toml
+[gaming]
+fan_mode = "gaming"
+gpu_boost = "on"
+ppd_profile = "performance"
+
+[balanced]
+fan_mode = "normal"
+ppd_profile = "balanced"
+
+[quiet]
+fan_mode = "silent"
+ppd_profile = "power-saver"
+```
+
+- **gigabytectl → PPD:** `sudo gigabytectl profile gaming` applies the hardware settings **and** switches the system power profile to `performance`.
+- **PPD → gigabytectl:** run the sync daemon so that flipping the power profile (from your desktop's quick settings, `powerprofilesctl`, etc.) automatically applies the matching gigabytectl profile:
+
+```bash
+sudo gigabytectl sync --once   # apply the profile mapped to the current power profile, then exit
+sudo gigabytectl sync          # keep watching and apply on every change (Ctrl-C to stop)
+```
+
+To run the watcher automatically at boot, install the provided systemd service (adjust `ExecStart` if `gigabytectl` isn't in `/usr/local/bin`):
+
+```bash
+sudo install -Dm644 assets/gigabytectl-ppd-sync.service /etc/systemd/system/gigabytectl-ppd-sync.service
+sudo systemctl enable --now gigabytectl-ppd-sync.service
+```
+
+> If `power-profiles-daemon` isn't installed, the `ppd_profile` field and `sync` command are simply inert — everything else works as before. Setting a power profile requires `busctl` (systemd); the watcher requires `gdbus` (glib2).
 
 ## ⌨️ Shell Completions
 
