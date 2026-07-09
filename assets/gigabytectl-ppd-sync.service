@@ -8,6 +8,8 @@ Wants=power-profiles-daemon.service
 [Service]
 Type=simple
 # Adjust the path if you installed elsewhere (e.g. /usr/bin/gigabytectl).
+# This runs as root, so it reads profiles from /etc/gigabytectl/profiles.toml
+# (not any user's ~/.config). `gigabytectl install-service` sets this up for you.
 ExecStart=/usr/local/bin/gigabytectl sync
 Restart=on-failure
 RestartSec=2
