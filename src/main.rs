@@ -286,6 +286,24 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("gigabytectl")
 }
 
+/// System-wide config directory. Used as a fallback when reading profiles so the
+/// sync service (which runs as root under systemd with `HOME=/root` and no
+/// `SUDO_USER`) can find profiles that don't live in any user's home.
+const SYSTEM_CONFIG_DIR: &str = "/etc/gigabytectl";
+
+/// Ordered directories to search for `profiles.toml`. The invoking user's config
+/// dir wins; the system-wide dir is the fallback that makes the root-run sync
+/// service work.
+fn profiles_search_dirs() -> Vec<PathBuf> {
+    let user = config_dir();
+    let system = PathBuf::from(SYSTEM_CONFIG_DIR);
+    if user == system {
+        vec![user]
+    } else {
+        vec![user, system]
+    }
+}
+
 /// Looks up a user's home directory from the passwd database.
 fn home_of_user(user: &str) -> Option<String> {
     let output = Command::new("getent").args(["passwd", user]).output().ok()?;
@@ -297,11 +315,14 @@ fn home_of_user(user: &str) -> Option<String> {
 }
 
 fn load_profiles() -> Result<HashMap<String, Profile>> {
-    let path = config_dir().join("profiles.toml");
-    match fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
-        Err(_) => Ok(HashMap::new()),
+    for dir in profiles_search_dirs() {
+        let path = dir.join("profiles.toml");
+        match fs::read_to_string(&path) {
+            Ok(text) => return toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+            Err(_) => continue,
+        }
     }
+    Ok(HashMap::new())
 }
 
 fn save_profiles(profiles: &HashMap<String, Profile>) -> Result<()> {
@@ -807,6 +828,10 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
+    /// Install and enable the power-profiles-daemon sync systemd service.
+    /// Seeds /etc/gigabytectl/profiles.toml from your profiles so the
+    /// root-run service can find them (run with sudo).
+    InstallService,
 }
 
 #[derive(Args)]
@@ -913,6 +938,7 @@ fn run_cli(command: Commands, config: &Config) -> Result<()> {
         Commands::Monitor { interval, json } => return run_monitor(*interval, *json, config),
         Commands::Profile(args) => return run_profile(args, config),
         Commands::Sync { once } => return run_sync(*once),
+        Commands::InstallService => return run_install_service(),
         _ => {}
     }
 
@@ -990,7 +1016,11 @@ fn run_cli(command: Commands, config: &Config) -> Result<()> {
                 write_fan_curve_point(index, temp, speed)?;
             }
         },
-        Commands::Monitor { .. } | Commands::Profile(_) | Commands::Sync { .. } | Commands::Completions { .. } => unreachable!(),
+        Commands::Monitor { .. }
+        | Commands::Profile(_)
+        | Commands::Sync { .. }
+        | Commands::Completions { .. }
+        | Commands::InstallService => unreachable!(),
     }
 
     Ok(())
@@ -1129,6 +1159,84 @@ fn run_sync(once: bool) -> Result<()> {
 
     let status = child.wait().context("waiting on gdbus monitor")?;
     anyhow::bail!("gdbus monitor exited unexpectedly ({})", status);
+}
+
+const SERVICE_NAME: &str = "gigabytectl-ppd-sync.service";
+const SERVICE_PATH: &str = "/etc/systemd/system/gigabytectl-ppd-sync.service";
+
+/// Installs and enables the systemd sync service. Because the service runs as
+/// root (no `SUDO_USER`, `HOME=/root`), it can't see profiles in a user's home,
+/// so we seed a system-wide copy in `/etc/gigabytectl` that `load_profiles`
+/// falls back to.
+fn run_install_service() -> Result<()> {
+    anyhow::ensure!(
+        is_root(),
+        "gigabytectl: installing the sync service writes to /etc; run as root (try: sudo gigabytectl install-service)"
+    );
+
+    // Point the unit at whatever binary is running this command.
+    let exe = std::env::current_exe().context("resolving current executable path")?;
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+
+    // Seed the system-wide profiles from the invoking user's profiles so the
+    // root-run service can find them.
+    fs::create_dir_all(SYSTEM_CONFIG_DIR).with_context(|| format!("creating {}", SYSTEM_CONFIG_DIR))?;
+    let system_profiles = PathBuf::from(SYSTEM_CONFIG_DIR).join("profiles.toml");
+    let user_profiles = config_dir().join("profiles.toml");
+    match fs::read_to_string(&user_profiles) {
+        Ok(text) => {
+            fs::write(&system_profiles, text)
+                .with_context(|| format!("writing {}", system_profiles.display()))?;
+            eprintln!("Copied profiles: {} -> {}", user_profiles.display(), system_profiles.display());
+        }
+        Err(_) if system_profiles.exists() => {
+            eprintln!("Keeping existing profiles at {}", system_profiles.display());
+        }
+        Err(_) => {
+            eprintln!("Note: no profiles found at {} yet.", user_profiles.display());
+            eprintln!(
+                "      Save one with `sudo gigabytectl profile --save <name>`, then re-run `sudo gigabytectl install-service`"
+            );
+            eprintln!("      (or edit {} directly).", system_profiles.display());
+        }
+    }
+
+    // Write the unit, pointing ExecStart at the resolved binary path.
+    let unit = format!(
+        "[Unit]\n\
+         Description=gigabytectl power-profiles-daemon sync\n\
+         Documentation=https://github.com/Code-Sapling/gigabytectl\n\
+         # Apply the mapped gigabytectl profile whenever the system power profile changes.\n\
+         After=power-profiles-daemon.service\n\
+         Wants=power-profiles-daemon.service\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} sync\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe = exe.display()
+    );
+    fs::write(SERVICE_PATH, unit).with_context(|| format!("writing {}", SERVICE_PATH))?;
+    eprintln!("Wrote {}", SERVICE_PATH);
+
+    run_systemctl(&["daemon-reload"])?;
+    run_systemctl(&["enable", "--now", SERVICE_NAME])?;
+    eprintln!("Enabled and started {SERVICE_NAME}.");
+    eprintln!("Check it with: systemctl status {SERVICE_NAME}");
+    Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(args)
+        .status()
+        .with_context(|| format!("running `systemctl {}`", args.join(" ")))?;
+    anyhow::ensure!(status.success(), "`systemctl {}` failed ({})", args.join(" "), status);
+    Ok(())
 }
 
 fn print_status(json: bool, units: Units) {

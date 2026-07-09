@@ -193,7 +193,17 @@ sudo gigabytectl sync --once   # apply the profile mapped to the current power p
 sudo gigabytectl sync          # keep watching and apply on every change (Ctrl-C to stop)
 ```
 
-To run the watcher automatically at boot, install the provided systemd service (adjust `ExecStart` if `gigabytectl` isn't in `/usr/local/bin`):
+To run the watcher automatically at boot, install the systemd service:
+
+```bash
+sudo gigabytectl install-service
+```
+
+This writes the unit (pointing `ExecStart` at your actual binary), enables and starts it, and copies your profiles to `/etc/gigabytectl/profiles.toml`.
+
+> **Why the copy?** The service runs as `root` under systemd, where `$SUDO_USER` is unset and `$HOME` is `/root`, so it can't see profiles saved in your home directory. gigabytectl reads `~/.config/gigabytectl/profiles.toml` first and falls back to `/etc/gigabytectl/profiles.toml`, which is where the service looks. After changing profiles, re-run `sudo gigabytectl install-service` (or edit the `/etc` copy directly) to update what the service applies.
+
+You can also install the unit by hand (adjust `ExecStart` if `gigabytectl` isn't in `/usr/local/bin`):
 
 ```bash
 sudo install -Dm644 assets/gigabytectl-ppd-sync.service /etc/systemd/system/gigabytectl-ppd-sync.service
