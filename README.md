@@ -104,7 +104,9 @@ sudo gigabytectl charge-limit set 80      # 60..100
 sudo gigabytectl gpu-boost get
 sudo gigabytectl gpu-boost set on         # on|off
 
-sudo gigabytectl battery-cycle
+sudo gigabytectl battery-cycle            # show the battery cycle count
+sudo gigabytectl light-sensor             # show light sensor data
+sudo gigabytectl fan-pwm                  # show current CPU fan PWM
 sudo gigabytectl fans                     # live fan RPM readings
 
 sudo gigabytectl fan-curve get            # all 15 points (index temp speed)
