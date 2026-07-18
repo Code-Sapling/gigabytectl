@@ -271,3 +271,14 @@ This project was built with the help of AI tools. AI was used for code generatio
 ## 💥 Issues
 
 If you find any problems or bugs, feel free to open an issue. Feedback and improvements are always welcome.
+
+## 📝 Notes
+
+- After updating **gigabytectl**, regenerate your [shell completions](https://github.com/Code-Sapling/gigabytectl#%EF%B8%8F-shell-completions).
+
+- After modifying `~/.config/gigabytectl/profiles.toml`, reinstall the systemd service and update `/etc/gigabytectl/profiles.toml`:
+  ```bash
+  sudo gigabytectl install-service
+  ```
+
+- Keep **gigabytectl** and **gigabyte-laptop-wmi** in sync. Whenever you update one, it's recommended to update the other to ensure compatibility.
