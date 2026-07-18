@@ -38,6 +38,8 @@ const GPU_BOOST: &str = "/sys/devices/platform/aorus_laptop/gpu_boost";
 const BATTERY_CYCLE: &str = "/sys/devices/platform/aorus_laptop/battery_cycle";
 const FAN_CURVE_INDEX: &str = "/sys/devices/platform/aorus_laptop/fan_curve_index";
 const FAN_CURVE_DATA: &str = "/sys/devices/platform/aorus_laptop/fan_curve_data";
+const LIGHT_SENSOR: &str = "/sys/devices/platform/aorus_laptop/light_sensor";
+const FAN_PWM: &str = "/sys/devices/platform/aorus_laptop/fan_pwm";
 
 const FAN_MODES: [&str; 6] = ["Normal", "Silent", "Gaming", "Custom", "Auto", "Fixed"];
 const FAN_MODE_COUNT: i32 = FAN_MODES.len() as i32;
@@ -578,6 +580,8 @@ struct App {
     charge_limit: Option<i32>,
     gpu_boost: Option<i32>,
     battery_cycle: Option<String>,
+    light_sensor: Option<String>,
+    fan_pwm: Option<i32>,
     
     fan_curve: Option<Vec<(i32, i32)>>,
     fan_curve_selected: usize,
@@ -620,6 +624,8 @@ impl App {
             charge_limit: None,
             gpu_boost: None,
             battery_cycle: None,
+            light_sensor: None,
+            fan_pwm: None,
             fan_curve: None,
             fan_curve_selected: 0,
             fan_curve_col: 0,
@@ -639,6 +645,8 @@ impl App {
         self.charge_limit = read_i32(CHARGE_LIMIT);
         self.gpu_boost = read_i32(GPU_BOOST);
         self.battery_cycle = read_trimmed(BATTERY_CYCLE);
+        self.light_sensor = read_trimmed(LIGHT_SENSOR);
+        self.fan_pwm = read_i32(FAN_PWM);
         self.fan_curve = read_fan_curve().ok();
 
         if let Some(hwmon) = &self.hwmon {
@@ -776,7 +784,7 @@ enum Commands {
         #[command(subcommand)]
         action: FanModeAction,
     },
-    /// Get or set the custom fan speed (25..100, step 5)
+    /// Get or set the custom fan speed (0..255)
     FanSpeed {
         #[command(subcommand)]
         action: ValueAction,
@@ -798,6 +806,10 @@ enum Commands {
     },
     /// Show the battery cycle count
     BatteryCycle,
+    /// Show light sensor data
+    LightSensor,
+    /// Show current CPU fan PWM
+    FanPwm,
     /// Show live fan RPM readings
     Fans,
     /// Get or set fan curve points
@@ -985,6 +997,8 @@ fn run_cli(command: Commands, config: &Config) -> Result<()> {
             }
         },
         Commands::BatteryCycle => println!("{}", battery_cycle_text(read_trimmed(BATTERY_CYCLE))),
+        Commands::LightSensor => println!("{}", read_trimmed(LIGHT_SENSOR).unwrap_or_else(|| "N/A".to_string())),
+        Commands::FanPwm => println!("{}", value_or_na(read_i32(FAN_PWM))),
         Commands::Fans => {
             let fans = GigabyteHwmon::new().map(|h| h.read_fans()).unwrap_or_default();
             if fans.is_empty() {
@@ -1246,6 +1260,8 @@ fn print_status(json: bool, units: Units) {
     let charge_limit = value_or_na(read_i32(CHARGE_LIMIT));
     let gpu_boost = gpu_boost_name(read_i32(GPU_BOOST));
     let battery_cycle = battery_cycle_text(read_trimmed(BATTERY_CYCLE));
+    let light_sensor = read_trimmed(LIGHT_SENSOR).unwrap_or_else(|| "N/A".to_string());
+    let fan_pwm = value_or_na(read_i32(FAN_PWM));
     let temps = Temps::read();
     let fans = GigabyteHwmon::new().map(|h| h.read_fans()).unwrap_or_default();
 
@@ -1255,13 +1271,15 @@ fn print_status(json: bool, units: Units) {
             .map(|f| format!(r#"{{"name":"{}","rpm":{}}}"#, json_escape(&f.name), f.rpm))
             .collect();
         println!(
-            r#"{{"fan_mode":"{}","fan_speed":"{}","charge_mode":"{}","charge_limit":"{}","gpu_boost":"{}","battery_cycle":"{}","cpu_temp":{},"gpu_temp":{},"fans":[{}]}}"#,
+            r#"{{"fan_mode":"{}","fan_speed":"{}","charge_mode":"{}","charge_limit":"{}","gpu_boost":"{}","battery_cycle":"{}","light_sensor":"{}","fan_pwm":"{}","cpu_temp":{},"gpu_temp":{},"fans":[{}]}}"#,
             json_escape(&fan_mode.to_lowercase()),
             json_escape(&fan_speed),
             json_escape(&charge_mode.to_lowercase()),
             json_escape(&charge_limit),
             json_escape(&gpu_boost.to_lowercase()),
             json_escape(&battery_cycle),
+            json_escape(&light_sensor),
+            json_escape(&fan_pwm),
             temps.cpu.map(|c| format!("{:.1}", to_units(c, units))).unwrap_or_else(|| "null".to_string()),
             temps.gpu.map(|g| format!("{:.1}", to_units(g, units))).unwrap_or_else(|| "null".to_string()),
             fans_json.join(",")
@@ -1273,6 +1291,8 @@ fn print_status(json: bool, units: Units) {
         println!("Charge limit:  {}", charge_limit);
         println!("GPU boost:     {}", gpu_boost);
         println!("Battery cycle: {}", battery_cycle);
+        println!("Light sensor:  {}", light_sensor);
+        println!("Fan PWM:       {}", fan_pwm);
         println!("CPU temp:      {}", format_temp(temps.cpu, units));
         println!("GPU temp:      {}", format_temp(temps.gpu, units));
         if !fans.is_empty() {
@@ -1287,10 +1307,10 @@ fn print_status(json: bool, units: Units) {
 // --- Utilities ---
 
 fn validate_fan_speed(value: i32) -> Result<()> {
-    if (25..=100).contains(&value) && value % 5 == 0 {
+    if (0..=255).contains(&value) {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("Fan speed must be 25..100 and divisible by 5"))
+        Err(anyhow::anyhow!("Fan speed must be 0..255"))
     }
 }
 
@@ -1591,7 +1611,7 @@ fn item_title(item: Item) -> &'static str {
 fn item_hint(item: Item) -> &'static str {
     match item {
         Item::FanMode => "Left/Right to cycle names",
-        Item::FanCustomSpeed => "Enter 25..100, divisible by 5",
+        Item::FanCustomSpeed => "Enter 0..255",
         Item::ChargeMode => "Left/Right toggles Normal/Custom",
         Item::ChargeLimit => "Enter 60..100",
         Item::GpuBoost => "Left/Right toggles ON/OFF",
@@ -1814,6 +1834,14 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Span::styled(battery_cycle_text(app.battery_cycle.clone()), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
+                Span::styled("Light sensor   ", Style::default().fg(Color::White)),
+                Span::styled(app.light_sensor.clone().unwrap_or_else(|| "N/A".to_string()), Style::default().fg(Color::Cyan)),
+            ]),
+            Line::from(vec![
+                Span::styled("Fan PWM        ", Style::default().fg(Color::White)),
+                Span::styled(value_or_na(app.fan_pwm), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
                 Span::styled("CPU temp       ", Style::default().fg(Color::White)),
                 Span::styled(format_temp(app.temps.cpu, app.config.units), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
             ]),
@@ -1894,7 +1922,7 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Span::styled(app.input.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(""),
-            Line::from("Fan speed: 25..100 in steps of 5"),
+            Line::from("Fan speed: 0..255"),
             Line::from("Charge limit: 60..100"),
             Line::from("Curve Temp: 0..100 | Curve Speed: 0..255"),
         ];
