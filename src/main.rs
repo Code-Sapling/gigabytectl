@@ -1231,7 +1231,7 @@ fn run_install_service() -> Result<()> {
          RestartSec=2\n\
          \n\
          [Install]\n\
-         WantedBy=multi-user.target\n",
+         WantedBy=power-profiles-daemon.service\n",
         exe = exe.display()
     );
     fs::write(SERVICE_PATH, unit).with_context(|| format!("writing {}", SERVICE_PATH))?;
