@@ -93,7 +93,7 @@ sudo gigabytectl fan-mode get
 sudo gigabytectl fan-mode set gaming      # normal|silent|gaming|custom|auto|fixed
 
 sudo gigabytectl fan-speed get
-sudo gigabytectl fan-speed set 50         # 25..100, step 5
+sudo gigabytectl fan-speed set 190        # 0..255
 
 sudo gigabytectl charge-mode get
 sudo gigabytectl charge-mode set custom   # normal|custom
@@ -146,7 +146,7 @@ ppd_profile = "performance" # optional: power-profiles-daemon profile (see below
 [quiet]
 fan_mode = "silent"
 charge_mode = "normal"     # normal|custom
-fan_custom_speed = 30      # 25..100, step 5
+fan_custom_speed = 120     # 0..255
 ppd_profile = "power-saver"
 # Optional full 15-point fan curve as [temp, speed] pairs:
 # fan_curve = [[0,0], [40,20], [50,40], [60,80], [70,120], [80,180],
