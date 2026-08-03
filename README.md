@@ -14,7 +14,11 @@ See More:
 - View fan speeds and CPU/GPU temperatures in real time
 - Control fan speed via a simple TUI
 - Live history graph of temperatures and fan RPM
-- Save and apply configuration profiles
+- Save, apply, update, and delete configuration profiles (from the CLI or the TUI)
+- Warns when a setting is inert (e.g. a charge limit with charging mode set to Normal)
+- Refuses fan curves that go backwards, which the hardware does not expect
+- `doctor` reports what the driver exposes on your specific model
+- Optional temperature notifications (off by default)
 - Scriptable headless/CLI mode for automation, including a `monitor` mode
 - Shell completions for bash, zsh, and fish
 - Configurable defaults (refresh interval, temperature units)
@@ -112,15 +116,22 @@ sudo gigabytectl fans                     # live fan RPM readings
 sudo gigabytectl fan-curve get            # all 15 points (index temp speed)
 sudo gigabytectl fan-curve get 3          # single point
 sudo gigabytectl fan-curve set 3 40 120   # index temp speed
+sudo gigabytectl fan-curve set 3 40 120 --force  # skip the ordering check
 
 gigabytectl monitor                       # live temps + fan RPM (Ctrl-C to stop)
 gigabytectl monitor --interval 2 --json   # custom interval, JSON per line
+gigabytectl monitor --csv -n 60           # 60 samples as CSV, then exit
+
+gigabytectl doctor                        # what this machine supports, and what's wrong
+
+gigabytectl config show                   # effective settings
+gigabytectl config set units fahrenheit   # change one setting
 
 sudo gigabytectl sync --once              # apply profile mapped to current power profile
 sudo gigabytectl sync                     # watch power-profiles-daemon and sync (see below)
 ```
 
-`monitor`, `completions`, and `profile --list` are read-only and do not require root. The other subcommands read from or write to `/sys` and require `sudo`; they exit with a clear error (rather than an interactive prompt) if not run as root, so they are safe to use in scripts.
+`monitor`, `doctor`, `config`, `completions`, and `profile --list` are read-only and do not require root. The other subcommands read from or write to `/sys` and require `sudo`; they exit with a clear error (rather than an interactive prompt) if not run as root, so they are safe to use in scripts.
 
 Run `gigabytectl --help` or `gigabytectl <command> --help` for the full list of commands and options.
 
@@ -130,9 +141,21 @@ Save a bundle of settings and reapply it later with a single command. Profiles l
 
 ```bash
 sudo gigabytectl profile --save gaming    # snapshot current settings as "gaming"
+sudo gigabytectl profile --save gaming --ppd performance   # ...and map it to a power profile
 gigabytectl profile --list                # list saved profiles
+gigabytectl profile --show gaming         # print one profile
+gigabytectl profile --delete gaming       # remove one
 sudo gigabytectl profile gaming           # apply the "gaming" profile
+sudo gigabytectl profile --sync-system    # copy profiles to /etc for the sync service
 ```
+
+Profiles are also managed from the TUI: select **Profiles**, then `Enter` to apply,
+`s` to save the current settings under a new name, `u` to update the selected profile
+from the current settings, and `d` to delete it.
+
+Saving or deleting a profile updates `/etc/gigabytectl/profiles.toml` automatically when
+that copy already exists and you are root, so the sync service stays in step without
+re-running `install-service`.
 
 You can also write profiles by hand. Every field is optional — a profile only changes what it specifies:
 
@@ -162,7 +185,26 @@ Optional defaults live in `~/.config/gigabytectl/config.toml`. Missing or invali
 refresh_interval_ms = 1000   # TUI auto-refresh and default monitor interval
 units = "celsius"            # celsius|fahrenheit (temperature display)
 history_length = 120         # samples kept in the TUI history graph
+
+[notifications]              # desktop alerts, off unless you turn them on
+enabled = false
+cpu_temp = 90.0              # threshold in degrees Celsius, whatever `units` displays
+gpu_temp = 90.0
+cooldown_secs = 300          # minimum gap between alerts for the same sensor
 ```
+
+Edit it by hand, or with the `config` subcommand:
+
+```bash
+gigabytectl config show                          # effective settings
+gigabytectl config keys                          # what can be set
+gigabytectl config get units
+gigabytectl config set notifications.enabled true
+sudo gigabytectl config set units celsius --system   # write /etc/gigabytectl/config.toml
+```
+
+Settings are read from `~/.config/gigabytectl/config.toml` first, then
+`/etc/gigabytectl/config.toml`, so the root-run sync service can be configured too.
 
 > When run under `sudo`, config is resolved from the invoking user's home (via `$SUDO_USER`), not root's, so `~/.config/gigabytectl` is the same whether or not you use `sudo`.
 

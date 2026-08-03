@@ -94,10 +94,7 @@ mod tests {
     #[test]
     fn fan_series_tracks_the_fastest_fan() {
         let mut history = History::new(4);
-        let fans = [
-            Fan { name: "Fan 1".into(), rpm: 1200 },
-            Fan { name: "Fan 2".into(), rpm: 3000 },
-        ];
+        let fans = [Fan::sample(1, 1200), Fan::sample(2, 3000)];
         history.push(Temps::default(), &fans);
         assert_eq!(history.rpm.points()[0].1, 3000.0);
     }

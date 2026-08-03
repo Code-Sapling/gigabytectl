@@ -14,7 +14,7 @@ use ratatui::{
 
 use crate::{
     app::{App, CurveColumn, EditTarget, Focus, Item},
-    config::Units,
+    config::{Profile, Units},
     history::{History, Series},
     sysfs,
 };
@@ -72,6 +72,24 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let (Focus::Editing, Some(target)) = (app.focus, app.editing) {
         edit_popup(frame, area, &app.input, target);
     }
+    if let Some(confirm) = &app.confirm {
+        confirm_popup(frame, area, &confirm.message);
+    }
+}
+
+fn confirm_popup(frame: &mut Frame, area: Rect, message: &str) {
+    let popup = centered_rect(50, 5, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(message.to_string(), theme::VALUE)),
+            Line::from(""),
+            Line::from(Span::styled("y = yes    n / Esc = no", theme::MUTED)),
+        ])
+        .block(block("Confirm").border_style(theme::POPUP))
+        .wrap(Wrap { trim: true }),
+        popup,
+    );
 }
 
 fn header(app: &App) -> Paragraph<'static> {
@@ -118,8 +136,15 @@ fn footer(app: &App) -> Paragraph<'static> {
     Paragraph::new(text).block(Block::bordered().style(theme::MUTED))
 }
 
-fn help(app: &App) -> Paragraph<'static> {
+fn help(app: &App) -> Paragraph<'_> {
     let (subject, value, hint, keys) = match app.focus {
+        Focus::ProfileList => (
+            "Profiles: ",
+            app.selected_profile().map_or("none saved", |(name, _)| name.as_str()),
+            "Enter applies the profile (and its power profile mapping).",
+            "↑/↓ select   Enter apply   s save new   u update   d delete   Esc back",
+        ),
+        Focus::Confirm => ("Confirm: ", "waiting", "This cannot be undone.", "y confirm   n / Esc cancel"),
         Focus::FanCurveList => (
             "Editing: ",
             "Fan Curve",
@@ -153,9 +178,69 @@ fn detail(frame: &mut Frame, area: Rect, app: &App) {
         Item::FanCurveView => fan_curve_chart(frame, area, app),
         Item::History => history_charts(frame, area, &app.history, app.config.units),
         Item::FanCurveEdit => frame.render_widget(fan_curve_table(app), area),
+        Item::Profiles => frame.render_widget(profile_list(app), area),
         _ if app.focus == Focus::FanCurveList => frame.render_widget(fan_curve_table(app), area),
+        _ if app.focus == Focus::ProfileList => frame.render_widget(profile_list(app), area),
         _ => frame.render_widget(dashboard(app), area),
     }
+}
+
+/// One line summarising what a profile changes, so the list is useful without
+/// opening each entry.
+fn profile_summary(profile: &Profile) -> String {
+    let mut parts = Vec::new();
+    if let Some(mode) = &profile.fan_mode {
+        parts.push(format!("fan {mode}"));
+    }
+    if let Some(speed) = profile.fan_custom_speed {
+        parts.push(format!("speed {speed}"));
+    }
+    if let Some(limit) = profile.charge_limit {
+        parts.push(format!("charge {limit}%"));
+    }
+    if let Some(boost) = &profile.gpu_boost {
+        parts.push(format!("boost {boost}"));
+    }
+    if profile.fan_curve.is_some() {
+        parts.push("curve".to_string());
+    }
+    if parts.is_empty() {
+        "empty".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn profile_list(app: &App) -> Paragraph<'static> {
+    let active = app.focus == Focus::ProfileList;
+    let mut lines = Vec::new();
+
+    if app.profiles.is_empty() {
+        lines.push(Line::from("No profiles saved yet."));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Press Enter here, then s to save the current settings as a profile.",
+            theme::MUTED,
+        )));
+    }
+
+    for (index, (name, profile)) in app.profiles.iter().enumerate() {
+        let selected = active && index == app.profile_row;
+        let mapping = profile
+            .ppd_profile
+            .as_ref()
+            .map_or_else(String::new, |ppd| format!("  ->  {ppd}"));
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} {name}{mapping}", if selected { ">" } else { " " }),
+            if selected { theme::SELECTED } else { theme::VALUE },
+        )]));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", profile_summary(profile)),
+            theme::MUTED,
+        )));
+    }
+
+    Paragraph::new(lines).block(block("Profiles"))
 }
 
 /// One `label   value` line of the dashboard.
@@ -164,6 +249,21 @@ fn row<'a>(label: &str, value: impl Into<Cow<'a, str>>, style: Style) -> Line<'a
         Span::styled(format!("{label:<15}"), theme::LABEL),
         Span::styled(value, style),
     ])
+}
+
+/// A dashboard row for a setting that only applies in certain modes, tagged
+/// with why it is doing nothing when that is the case.
+fn dependent_row<'a>(
+    label: &str,
+    value: impl Into<Cow<'a, str>>,
+    hw: &sysfs::HwState,
+    setting: sysfs::Dependent,
+) -> Line<'a> {
+    let mut line = row(label, value, theme::NUMBER);
+    if let Some(reason) = hw.inactive_reason(setting) {
+        line.push_span(Span::styled(format!("  inactive — {reason}"), theme::MUTED));
+    }
+    line
 }
 
 fn dashboard(app: &App) -> Paragraph<'_> {
@@ -175,9 +275,19 @@ fn dashboard(app: &App) -> Paragraph<'_> {
 
     let mut lines = vec![
         row("Fan mode", fan_mode.clone(), badge_style(&fan_mode)),
-        row("Fan speed", sysfs::value_or_na(hw.fan_custom_speed), theme::NUMBER),
+        dependent_row(
+            "Fan speed",
+            sysfs::value_or_na(hw.fan_custom_speed),
+            hw,
+            sysfs::Dependent::FanCustomSpeed,
+        ),
         row("Charge mode", charge_mode.clone(), badge_style(&charge_mode)),
-        row("Charge limit", sysfs::value_or_na(hw.charge_limit), theme::NUMBER),
+        dependent_row(
+            "Charge limit",
+            sysfs::value_or_na(hw.charge_limit),
+            hw,
+            sysfs::Dependent::ChargeLimit,
+        ),
         row("GPU boost", gpu_boost, badge_style(gpu_boost)),
         row("Battery cycle", hw.battery_cycle_text(), theme::INFO),
         row("Light sensor", hw.light_sensor_text(), Style::new().fg(theme::ACCENT)),
@@ -189,16 +299,20 @@ fn dashboard(app: &App) -> Paragraph<'_> {
     if !app.fans.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Fan readings:", theme::HEADING)));
-        lines.extend(
-            app.fans
-                .iter()
-                .map(|fan| row(&fan.name, format!("{} RPM", fan.rpm), theme::GPU)),
-        );
+        lines.extend(app.fans.iter().map(|fan| row(&fan.name, fan.reading(), theme::GPU)));
     }
 
     Paragraph::new(lines)
         .block(block("Current values"))
         .wrap(Wrap { trim: true })
+}
+
+/// Panel title for the curve views, noting when the curve is not in use.
+fn fan_curve_title(app: &App, base: &str) -> String {
+    match app.hw.inactive_reason(sysfs::Dependent::FanCurve) {
+        Some(reason) => format!("{base} (inactive — {reason})"),
+        None => base.to_string(),
+    }
 }
 
 fn fan_curve_table(app: &App) -> Paragraph<'static> {
@@ -232,18 +346,21 @@ fn fan_curve_table(app: &App) -> Paragraph<'static> {
 
     // Deliberately not wrapped: wrapping trims the leading padding, which
     // knocks the two-digit rows out of their columns.
-    Paragraph::new(lines).block(block("Fan Curve Editor"))
+    Paragraph::new(lines).block(block(fan_curve_title(app, "Fan Curve Editor")))
 }
 
 fn fan_curve_chart(frame: &mut Frame, area: Rect, app: &App) {
     let Some(curve) = &app.fan_curve else {
-        frame.render_widget(placeholder("Failed to read fan curve data.", "Fan Curve Graph"), area);
+        frame.render_widget(
+            placeholder("Failed to read fan curve data.", &fan_curve_title(app, "Fan Curve Graph")),
+            area,
+        );
         return;
     };
 
     let points: Vec<(f64, f64)> = curve.iter().map(|&(t, s)| (t.into(), s.into())).collect();
     let chart = Chart::new(vec![dataset("Curve", theme::ACCENT, &points)])
-        .block(block("Fan Curve Graph"))
+        .block(block(fan_curve_title(app, "Fan Curve Graph")))
         .x_axis(axis([0.0, 100.0], ticks([0.0, 100.0], "")).title("Temp (°C)"))
         .y_axis(axis([0.0, 255.0], ticks([0.0, 255.0], "")).title("Speed"));
     frame.render_widget(chart, area);
@@ -295,8 +412,7 @@ fn history_charts(frame: &mut Frame, area: Rect, history: &History, units: Units
 }
 
 fn edit_popup(frame: &mut Frame, area: Rect, input: &str, target: EditTarget) {
-    let popup = centered_rect(56, 24, area);
-    let range = target.range();
+    let popup = centered_rect(56, 7, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(vec![
@@ -311,7 +427,7 @@ fn edit_popup(frame: &mut Frame, area: Rect, input: &str, target: EditTarget) {
                 Span::styled(input.to_string(), theme::VALUE),
             ]),
             Line::from(""),
-            Line::from(format!("Allowed: {}..{}", range.start(), range.end())),
+            Line::from(target.hint()),
         ])
         .block(block("Edit value").border_style(theme::POPUP))
         .wrap(Wrap { trim: true }),
@@ -358,9 +474,12 @@ fn placeholder<'a>(text: &'a str, title: &'a str) -> Paragraph<'a> {
     Paragraph::new(text).block(block(title))
 }
 
-/// A rectangle covering `percent_x` × `percent_y` of `area`, centred.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let [area] = Layout::vertical([Constraint::Percentage(percent_y)])
+/// A centred rectangle `percent_x` wide and exactly `rows` tall.
+///
+/// Popups hold a fixed number of lines, so sizing their height as a percentage
+/// clips the last line on shorter terminals.
+fn centered_rect(percent_x: u16, rows: u16, area: Rect) -> Rect {
+    let [area] = Layout::vertical([Constraint::Length(rows)])
         .flex(Flex::Center)
         .areas(area);
     let [area] = Layout::horizontal([Constraint::Percentage(percent_x)])
@@ -393,11 +512,14 @@ mod tests {
     }
 
     #[test]
-    fn centered_rect_is_centered_and_smaller() {
+    fn centered_rect_is_centered_with_an_exact_height() {
         let area = Rect::new(0, 0, 100, 100);
         let popup = centered_rect(50, 20, area);
         assert_eq!((popup.width, popup.height), (50, 20));
         assert_eq!((popup.x, popup.y), (25, 40));
+        // A popup taller than the screen is clamped rather than overflowing.
+        let tiny = centered_rect(50, 20, Rect::new(0, 0, 20, 6));
+        assert!(tiny.height <= 6 && tiny.width <= 20);
     }
 
     /// Rendering must not panic on tiny terminals or with no data yet.

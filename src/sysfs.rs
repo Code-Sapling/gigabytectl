@@ -8,12 +8,16 @@ use std::{borrow::Cow, fs, io, ops::RangeInclusive, path::Path};
 use anyhow::{Context, Result, anyhow, ensure};
 
 /// Declares the driver root plus one `&'static str` constant per attribute, so
-/// the root path is written exactly once.
+/// the root path is written exactly once, and a table of them all for
+/// reporting which attributes a model actually supports.
 macro_rules! sysfs_nodes {
     ($root:literal, $($name:ident => $file:literal),+ $(,)?) => {
         /// Platform directory exposed by the `gigabyte-laptop-wmi` module.
         pub const ROOT: &str = $root;
         $(pub const $name: &str = concat!($root, "/", $file);)+
+
+        /// Every attribute this tool knows about, as `(name, path)`.
+        pub const ALL_NODES: [(&str, &str); [$($file),+].len()] = [$(($file, $name)),+];
     };
 }
 
@@ -162,6 +166,36 @@ pub fn battery_cycle_text(value: Option<&str>) -> String {
     }
 }
 
+// --- Light sensor ---
+
+/// Decodes the `light_sensor` node.
+///
+/// Newer models (VE and later) report four bytes as `<version> <low> <medium>
+/// <high>`, where the reading is the last three recombined; older models report
+/// a single 32-bit value. Either way `0` means no sensor is fitted.
+pub fn parse_light_sensor(raw: &str) -> Option<u32> {
+    let parts: Vec<u32> = raw.split_whitespace().map(str::parse).collect::<Result<_, _>>().ok()?;
+    match parts[..] {
+        [value] => Some(value),
+        // The leading byte is a format version, not part of the reading.
+        [_, low, medium, high] => Some((high << 16) | (medium << 8) | low),
+        _ => None,
+    }
+}
+
+/// Human-readable light sensor reading.
+pub fn light_sensor_text(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        None => "N/A".to_string(),
+        Some(raw) => match parse_light_sensor(raw) {
+            Some(0) => "Not equipped".to_string(),
+            Some(value) => value.to_string(),
+            // Show whatever the driver said rather than hiding an unknown format.
+            None => format!("Unknown ({raw})"),
+        },
+    }
+}
+
 // --- Fan curve ---
 
 /// Reads all [`FAN_CURVE_POINTS`] `(temperature, speed)` points.
@@ -187,7 +221,69 @@ fn parse_fan_curve_point(data: &str) -> Result<(i32, i32)> {
     }
 }
 
+/// Checks that a whole curve is non-decreasing in both temperature and speed,
+/// which is what the driver documents the hardware expects. A curve that dips
+/// can make the fans slow down as the machine gets hotter.
+pub fn validate_fan_curve(curve: &[(i32, i32)]) -> Result<()> {
+    for (index, &(temp, speed)) in curve.iter().enumerate() {
+        check_range(temp, &CURVE_TEMP_RANGE, "Temperature")?;
+        check_range(speed, &CURVE_SPEED_RANGE, "Speed")?;
+        let Some(&(previous_temp, previous_speed)) = index.checked_sub(1).and_then(|i| curve.get(i)) else {
+            continue;
+        };
+        ensure!(
+            temp >= previous_temp,
+            "Fan curve must not go backwards: point {index} temperature {temp} is below point {} ({previous_temp})",
+            index - 1
+        );
+        ensure!(
+            speed >= previous_speed,
+            "Fan curve must not go backwards: point {index} speed {speed} is below point {} ({previous_speed})",
+            index - 1
+        );
+    }
+    Ok(())
+}
+
+/// The values a single point may take without breaking the ordering of the rest
+/// of `curve`, as `(min, max)` for each of temperature and speed.
+fn curve_point_bounds(curve: &[(i32, i32)], index: usize) -> ((i32, i32), (i32, i32)) {
+    let before = index.checked_sub(1).and_then(|i| curve.get(i));
+    let after = curve.get(index + 1);
+    (
+        (
+            before.map_or(*CURVE_TEMP_RANGE.start(), |p| p.0),
+            after.map_or(*CURVE_TEMP_RANGE.end(), |p| p.0),
+        ),
+        (
+            before.map_or(*CURVE_SPEED_RANGE.start(), |p| p.1),
+            after.map_or(*CURVE_SPEED_RANGE.end(), |p| p.1),
+        ),
+    )
+}
+
+/// Checks one edited point against the curve it is going into, reporting the
+/// range it may take so the value can be corrected without guesswork.
+pub fn validate_curve_point_in(curve: &[(i32, i32)], index: usize, temp: i32, speed: i32) -> Result<()> {
+    validate_curve_index(index)?;
+    check_range(temp, &CURVE_TEMP_RANGE, "Temperature")?;
+    check_range(speed, &CURVE_SPEED_RANGE, "Speed")?;
+    let ((temp_min, temp_max), (speed_min, speed_max)) = curve_point_bounds(curve, index);
+    ensure!(
+        (temp_min..=temp_max).contains(&temp),
+        "Temperature must be {temp_min}..{temp_max} to keep the curve in order (neighbouring points)"
+    );
+    ensure!(
+        (speed_min..=speed_max).contains(&speed),
+        "Speed must be {speed_min}..{speed_max} to keep the curve in order (neighbouring points)"
+    );
+    Ok(())
+}
+
 /// Writes one `(temperature, speed)` point of the fan curve.
+///
+/// This does not check the point against its neighbours; callers editing a
+/// loaded curve should use [`validate_curve_point_in`] first.
 pub fn write_fan_curve_point(index: usize, temp: i32, speed: i32) -> Result<()> {
     validate_curve_index(index)?;
     check_range(temp, &CURVE_TEMP_RANGE, "Temperature")?;
@@ -199,6 +295,35 @@ pub fn write_fan_curve_point(index: usize, temp: i32, speed: i32) -> Result<()> 
 /// The data node takes both halves of a point packed into one integer.
 fn pack_fan_curve_point(temp: i32, speed: i32) -> i32 {
     (speed * 256) + temp
+}
+
+// --- Setting dependencies ---
+
+/// Fan mode values that other settings depend on.
+const FAN_MODE_CUSTOM: i32 = 3;
+const FAN_MODE_AUTO: i32 = 4;
+const FAN_MODE_FIXED: i32 = 5;
+const CHARGE_MODE_CUSTOM: i32 = 1;
+
+/// A setting whose value only reaches the hardware while another node is in a
+/// particular mode. Writing one of these otherwise succeeds and does nothing,
+/// which is the most common source of confusion with this driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dependent {
+    FanCustomSpeed,
+    FanCurve,
+    ChargeLimit,
+}
+
+impl Dependent {
+    /// What has to be true for this setting to take effect.
+    pub fn requirement(self) -> &'static str {
+        match self {
+            Self::FanCustomSpeed => "requires Auto or Fixed fan mode",
+            Self::FanCurve => "requires Custom fan mode",
+            Self::ChargeLimit => "requires Custom charge mode",
+        }
+    }
 }
 
 // --- Snapshot ---
@@ -236,7 +361,27 @@ impl HwState {
     }
 
     pub fn light_sensor_text(&self) -> String {
-        self.light_sensor.clone().unwrap_or_else(|| "N/A".to_string())
+        light_sensor_text(self.light_sensor.as_deref())
+    }
+
+    /// Whether a mode-dependent setting is currently doing anything.
+    pub fn is_active(&self, setting: Dependent) -> bool {
+        match setting {
+            Dependent::FanCustomSpeed => matches!(self.fan_mode, Some(FAN_MODE_AUTO | FAN_MODE_FIXED)),
+            Dependent::FanCurve => self.fan_mode == Some(FAN_MODE_CUSTOM),
+            Dependent::ChargeLimit => self.charge_mode == Some(CHARGE_MODE_CUSTOM),
+        }
+    }
+
+    /// `Some(reason)` when the setting currently has no effect. Reads that
+    /// failed are reported as active, so an unreadable node never produces a
+    /// misleading warning.
+    pub fn inactive_reason(&self, setting: Dependent) -> Option<&'static str> {
+        let known = match setting {
+            Dependent::FanCustomSpeed | Dependent::FanCurve => self.fan_mode.is_some(),
+            Dependent::ChargeLimit => self.charge_mode.is_some(),
+        };
+        (known && !self.is_active(setting)).then(|| setting.requirement())
     }
 }
 
@@ -297,6 +442,100 @@ mod tests {
         assert_eq!(parse_fan_curve_point("  7\t9\n").unwrap(), (7, 9));
         assert!(parse_fan_curve_point("50").is_err());
         assert!(parse_fan_curve_point("").is_err());
+    }
+
+    #[test]
+    fn mode_dependent_settings_report_when_they_are_inert() {
+        let with_modes = |fan_mode, charge_mode| HwState {
+            fan_mode: Some(fan_mode),
+            charge_mode: Some(charge_mode),
+            ..HwState::default()
+        };
+
+        // Custom fan speed only applies in Auto (4) or Fixed (5).
+        let fixed = with_modes(5, 0);
+        assert!(fixed.is_active(Dependent::FanCustomSpeed));
+        assert_eq!(fixed.inactive_reason(Dependent::FanCustomSpeed), None);
+        assert!(with_modes(4, 0).is_active(Dependent::FanCustomSpeed));
+        assert_eq!(
+            with_modes(0, 0).inactive_reason(Dependent::FanCustomSpeed),
+            Some("requires Auto or Fixed fan mode")
+        );
+
+        // The fan curve only applies in Custom (3).
+        assert!(with_modes(3, 0).is_active(Dependent::FanCurve));
+        assert_eq!(
+            with_modes(5, 0).inactive_reason(Dependent::FanCurve),
+            Some("requires Custom fan mode")
+        );
+
+        // The charge limit only applies in Custom charge mode (1).
+        assert!(with_modes(0, 1).is_active(Dependent::ChargeLimit));
+        assert_eq!(
+            with_modes(0, 0).inactive_reason(Dependent::ChargeLimit),
+            Some("requires Custom charge mode")
+        );
+
+        // An unreadable mode must not produce a misleading warning.
+        let unknown = HwState::default();
+        assert_eq!(unknown.inactive_reason(Dependent::FanCustomSpeed), None);
+        assert_eq!(unknown.inactive_reason(Dependent::ChargeLimit), None);
+    }
+
+    #[test]
+    fn curves_must_not_go_backwards() {
+        let rising: Vec<(i32, i32)> = (0..FAN_CURVE_POINTS).map(|i| (i as i32 * 5, i as i32 * 10)).collect();
+        assert!(validate_fan_curve(&rising).is_ok());
+        // Repeated points are allowed; the driver asks for non-decreasing.
+        assert!(validate_fan_curve(&[(40, 100), (40, 100), (50, 120)]).is_ok());
+        assert!(validate_fan_curve(&[]).is_ok());
+
+        let dipping_temp = validate_fan_curve(&[(40, 100), (30, 120)]).unwrap_err().to_string();
+        assert!(dipping_temp.contains("temperature 30 is below point 0 (40)"), "{dipping_temp}");
+        let dipping_speed = validate_fan_curve(&[(40, 100), (50, 80)]).unwrap_err().to_string();
+        assert!(dipping_speed.contains("speed 80 is below point 0 (100)"), "{dipping_speed}");
+        // Out-of-range values are still caught.
+        assert!(validate_fan_curve(&[(200, 10)]).is_err());
+    }
+
+    #[test]
+    fn editing_a_point_is_bounded_by_its_neighbours() {
+        let curve = [(30, 40), (50, 100), (70, 200)];
+        // The middle point may move between its neighbours, but not past them.
+        assert!(validate_curve_point_in(&curve, 1, 60, 150).is_ok());
+        assert!(validate_curve_point_in(&curve, 1, 30, 40).is_ok());
+        assert!(validate_curve_point_in(&curve, 1, 29, 100).is_err());
+        assert!(validate_curve_point_in(&curve, 1, 71, 100).is_err());
+        assert!(validate_curve_point_in(&curve, 1, 60, 201).is_err());
+
+        // The ends are bounded by the hardware range on the open side.
+        assert!(validate_curve_point_in(&curve, 0, 0, 0).is_ok());
+        assert!(validate_curve_point_in(&curve, 2, 100, 255).is_ok());
+
+        let message = validate_curve_point_in(&curve, 1, 80, 100).unwrap_err().to_string();
+        assert!(message.contains("must be 30..70"), "{message}");
+    }
+
+    #[test]
+    fn light_sensor_decodes_both_reporting_formats() {
+        // Newer models: leading version byte, then low/medium/high.
+        assert_eq!(parse_light_sensor("247 1 2 3"), Some(3 * 65536 + 2 * 256 + 1));
+        assert_eq!(parse_light_sensor("247 255 255 255"), Some(0x00FF_FFFF));
+        // Older models: a single 32-bit value.
+        assert_eq!(parse_light_sensor("4096"), Some(4096));
+        // Anything else is not guessed at.
+        assert_eq!(parse_light_sensor("1 2"), None);
+        assert_eq!(parse_light_sensor(""), None);
+        assert_eq!(parse_light_sensor("-1"), None);
+    }
+
+    #[test]
+    fn light_sensor_zero_means_no_sensor_fitted() {
+        assert_eq!(light_sensor_text(Some("0")), "Not equipped");
+        assert_eq!(light_sensor_text(Some("247 0 0 0")), "Not equipped");
+        assert_eq!(light_sensor_text(Some("247 16 1 0")), "272");
+        assert_eq!(light_sensor_text(Some("1 2")), "Unknown (1 2)");
+        assert_eq!(light_sensor_text(None), "N/A");
     }
 
     #[test]

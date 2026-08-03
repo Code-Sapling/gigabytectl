@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{ppd, sysfs, system};
@@ -60,7 +60,32 @@ impl Units {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Desktop notifications for temperature thresholds. Off unless switched on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notifications {
+    /// Opt in to temperature alerts.
+    pub enabled: bool,
+    /// CPU threshold in degrees Celsius, whatever `units` is set to display.
+    pub cpu_temp: f32,
+    /// GPU threshold in degrees Celsius.
+    pub gpu_temp: f32,
+    /// Minimum gap between alerts for the same sensor.
+    pub cooldown_secs: u64,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cpu_temp: 90.0,
+            gpu_temp: 90.0,
+            cooldown_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// TUI auto-refresh interval in milliseconds (also the default for `monitor`).
@@ -69,6 +94,8 @@ pub struct Config {
     pub units: Units,
     /// Number of samples kept in the TUI history graph.
     pub history_length: usize,
+    /// Temperature alerts (disabled by default).
+    pub notifications: Notifications,
 }
 
 impl Default for Config {
@@ -77,26 +104,140 @@ impl Default for Config {
             refresh_interval_ms: 1000,
             units: Units::Celsius,
             history_length: 120,
+            notifications: Notifications::default(),
         }
     }
 }
 
 impl Config {
-    /// Loads the config, falling back to defaults if it is missing or invalid.
+    /// Every key `config get`/`config set` understands.
+    pub const KEYS: [&'static str; 7] = [
+        "refresh_interval_ms",
+        "units",
+        "history_length",
+        "notifications.enabled",
+        "notifications.cpu_temp",
+        "notifications.gpu_temp",
+        "notifications.cooldown_secs",
+    ];
+
+    /// Loads the config from the user's directory, falling back to the
+    /// system-wide copy and then to defaults. A file that fails to parse is
+    /// reported rather than silently ignored.
     pub fn load() -> Self {
-        let path = config_dir().join(CONFIG_FILE);
-        let Ok(text) = fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        toml::from_str(&text).unwrap_or_else(|e| {
-            eprintln!("Warning: failed to parse {}: {e}. Using defaults.", path.display());
-            Self::default()
-        })
+        for path in config_search_dirs().into_iter().map(|dir| dir.join(CONFIG_FILE)) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            return toml::from_str(&text).unwrap_or_else(|e| {
+                eprintln!("Warning: failed to parse {}: {e}. Using defaults.", path.display());
+                Self::default()
+            });
+        }
+        Self::default()
     }
 
     pub fn refresh_interval(&self) -> Duration {
         Duration::from_millis(self.refresh_interval_ms).max(MIN_REFRESH_INTERVAL)
     }
+
+    /// Reads one key by its dotted name.
+    pub fn get(&self, key: &str) -> Result<String> {
+        Ok(match key {
+            "refresh_interval_ms" => self.refresh_interval_ms.to_string(),
+            "units" => match self.units {
+                Units::Celsius => "celsius".to_string(),
+                Units::Fahrenheit => "fahrenheit".to_string(),
+            },
+            "history_length" => self.history_length.to_string(),
+            "notifications.enabled" => self.notifications.enabled.to_string(),
+            "notifications.cpu_temp" => self.notifications.cpu_temp.to_string(),
+            "notifications.gpu_temp" => self.notifications.gpu_temp.to_string(),
+            "notifications.cooldown_secs" => self.notifications.cooldown_secs.to_string(),
+            other => bail!("Unknown config key '{other}' (known keys: {})", Self::KEYS.join(", ")),
+        })
+    }
+
+    /// Writes one key by its dotted name, parsing `value` for that key's type.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        let value = value.trim();
+        match key {
+            "refresh_interval_ms" => self.refresh_interval_ms = parse_value(key, value)?,
+            "units" => {
+                self.units = match value.to_ascii_lowercase().as_str() {
+                    "celsius" | "c" => Units::Celsius,
+                    "fahrenheit" | "f" => Units::Fahrenheit,
+                    other => bail!("units must be celsius or fahrenheit, got '{other}'"),
+                }
+            }
+            "history_length" => self.history_length = parse_value(key, value)?,
+            "notifications.enabled" => {
+                self.notifications.enabled = match value.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "on" | "1" => true,
+                    "false" | "no" | "off" | "0" => false,
+                    other => bail!("{key} must be true or false, got '{other}'"),
+                }
+            }
+            "notifications.cpu_temp" => self.notifications.cpu_temp = parse_value(key, value)?,
+            "notifications.gpu_temp" => self.notifications.gpu_temp = parse_value(key, value)?,
+            "notifications.cooldown_secs" => self.notifications.cooldown_secs = parse_value(key, value)?,
+            other => bail!("Unknown config key '{other}' (known keys: {})", Self::KEYS.join(", ")),
+        }
+        Ok(())
+    }
+}
+
+fn parse_value<T: std::str::FromStr>(key: &str, value: &str) -> Result<T> {
+    value
+        .parse()
+        .map_err(|_| anyhow!("'{value}' is not a valid value for {key}"))
+}
+
+/// Loads one specific config file, falling back to defaults when it is missing
+/// or unreadable. Used when editing a file rather than the merged view.
+pub fn load_config_file(path: &Path) -> Config {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| match toml::from_str(&text) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                eprintln!("Warning: failed to parse {}: {e}. Starting from defaults.", path.display());
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Writes the config to the user's directory, or the system-wide one.
+pub fn save_config(config: &Config, system: bool) -> Result<PathBuf> {
+    let dir = if system {
+        PathBuf::from(SYSTEM_CONFIG_DIR)
+    } else {
+        config_dir()
+    };
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(CONFIG_FILE);
+    let text = toml::to_string_pretty(config).context("serializing config")?;
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    if !system {
+        system::chown_to_sudo_user(&dir);
+    }
+    Ok(path)
+}
+
+/// Ordered directories searched for `config.toml`, mirroring how profiles are
+/// resolved so a root-run service sees the same settings.
+fn config_search_dirs() -> Vec<PathBuf> {
+    search_dirs()
+}
+
+pub fn config_path(system: bool) -> PathBuf {
+    if system {
+        PathBuf::from(SYSTEM_CONFIG_DIR)
+    } else {
+        config_dir()
+    }
+    .join(CONFIG_FILE)
 }
 
 /// A saved snapshot of controllable values. All fields are optional so a profile
@@ -159,6 +300,8 @@ impl Profile {
                 sysfs::FAN_CURVE_POINTS,
                 curve.len()
             );
+            let points: Vec<(i32, i32)> = curve.iter().map(|point| (point[0], point[1])).collect();
+            sysfs::validate_fan_curve(&points)?;
         }
 
         for (node, value) in [
@@ -208,10 +351,10 @@ pub fn profiles_path() -> PathBuf {
     config_dir().join(PROFILES_FILE)
 }
 
-/// Ordered directories searched for profiles. The invoking user's config dir
-/// wins; the system-wide dir is the fallback that makes the root-run sync
+/// Ordered directories searched for configuration. The invoking user's config
+/// dir wins; the system-wide dir is the fallback that makes the root-run sync
 /// service work.
-fn profiles_search_dirs() -> Vec<PathBuf> {
+fn search_dirs() -> Vec<PathBuf> {
     let user = config_dir();
     if user == Path::new(SYSTEM_CONFIG_DIR) {
         vec![user]
@@ -220,8 +363,12 @@ fn profiles_search_dirs() -> Vec<PathBuf> {
     }
 }
 
+pub fn system_profiles_path() -> PathBuf {
+    Path::new(SYSTEM_CONFIG_DIR).join(PROFILES_FILE)
+}
+
 pub fn load_profiles() -> Result<HashMap<String, Profile>> {
-    for dir in profiles_search_dirs() {
+    for dir in search_dirs() {
         let path = dir.join(PROFILES_FILE);
         if let Ok(text) = fs::read_to_string(&path) {
             return toml::from_str(&text).with_context(|| format!("parsing {}", path.display()));
@@ -235,9 +382,46 @@ pub fn save_profiles(profiles: &HashMap<String, Profile>) -> Result<()> {
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(PROFILES_FILE);
     let text = toml::to_string_pretty(profiles).context("serializing profiles")?;
-    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
     system::chown_to_sudo_user(&dir);
+
+    // Keep the copy the root-run sync service reads in step, so edits do not
+    // silently apply only to the interactive tool.
+    if let Err(e) = sync_profiles_to_system(&text) {
+        eprintln!("Warning: could not update {}: {e:#}", system_profiles_path().display());
+    }
     Ok(())
+}
+
+/// Mirrors the user's profiles into the system-wide copy.
+///
+/// Only updates a copy that already exists: creating one implies installing
+/// system state, which is `install-service`'s job. Returns whether it wrote.
+pub fn sync_profiles_to_system(text: &str) -> Result<bool> {
+    let path = system_profiles_path();
+    if !path.exists() || config_dir() == Path::new(SYSTEM_CONFIG_DIR) {
+        return Ok(false);
+    }
+    // Without root this is expected to fail; say so rather than looking broken.
+    ensure!(
+        system::is_root(),
+        "{} needs root to update (re-run with sudo, or `sudo gigabytectl profile --sync-system`)",
+        path.display()
+    );
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Copies the current user profiles over the system-wide copy, creating it if
+/// need be. Used by `profile --sync-system` and `install-service`.
+pub fn seed_system_profiles() -> Result<PathBuf> {
+    let dir = Path::new(SYSTEM_CONFIG_DIR);
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let profiles = load_profiles()?;
+    let text = toml::to_string_pretty(&profiles).context("serializing profiles")?;
+    let path = system_profiles_path();
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 #[cfg(test)]

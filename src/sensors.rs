@@ -22,10 +22,42 @@ const GPU_HWMON: [&str; 2] = ["amdgpu", "nouveau"];
 /// for this long rather than blocking every refresh.
 const NVIDIA_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// The driver's hwmon fan channels are fixed: 1 is the CPU fan, 2 the GPU fan,
+/// and 3 and 4 are extra fans only some models are fitted with.
+const FAN_CHANNEL_NAMES: [&str; 2] = ["CPU fan", "GPU fan"];
+/// Channels that always exist, so a reading of `0` means "stopped" rather than
+/// "not fitted" and is worth showing.
+const ALWAYS_PRESENT_FANS: u32 = FAN_CHANNEL_NAMES.len() as u32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fan {
+    /// hwmon channel number, starting at 1.
+    pub channel: u32,
     pub name: String,
     pub rpm: u32,
+    /// Raw PWM duty for this fan, for the channels that report one. The driver
+    /// passes the embedded controller's value through unscaled and its range is
+    /// undocumented, so it is shown as-is rather than as a percentage.
+    pub pwm: Option<u32>,
+}
+
+impl Fan {
+    /// `"5357 RPM (PWM 60)"`, or just the RPM when the channel reports no duty.
+    pub fn reading(&self) -> String {
+        match self.pwm {
+            Some(pwm) => format!("{} RPM (PWM {pwm})", self.rpm),
+            None => format!("{} RPM", self.rpm),
+        }
+    }
+
+    fn name_for(channel: u32) -> String {
+        // hwmon channels are 1-based; anything outside the known set keeps a
+        // generic name.
+        (channel as usize)
+            .checked_sub(1)
+            .and_then(|index| FAN_CHANNEL_NAMES.get(index))
+            .map_or_else(|| format!("Fan {channel}"), |name| (*name).to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -65,9 +97,11 @@ impl Sensors {
         }
     }
 
-    /// Live fan readings, ordered by fan number. Channels reporting `0` are
-    /// omitted: the driver exposes a fixed set of inputs, not all of which are
-    /// wired up on every model.
+    /// Live fan readings, ordered by channel.
+    ///
+    /// The CPU and GPU fans are always reported, so a stopped fan reads `0`
+    /// rather than vanishing from the list. The extra channels only exist on
+    /// some models, so those are dropped when they read `0`.
     pub fn read_fans(&self) -> Vec<Fan> {
         let Some(dir) = &self.fans else {
             return Vec::new();
@@ -76,19 +110,27 @@ impl Sensors {
             return Vec::new();
         };
 
-        let mut fans: Vec<(u32, Fan)> = entries
+        let mut fans: Vec<Fan> = entries
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
-                let index = fan_input_index(path.file_name()?.to_str()?)?;
+                let channel = fan_input_index(path.file_name()?.to_str()?)?;
                 let rpm: u32 = fs::read_to_string(&path).ok()?.trim().parse().ok()?;
-                (rpm > 0).then(|| (index, Fan { name: format!("Fan {index}"), rpm }))
+                if rpm == 0 && channel > ALWAYS_PRESENT_FANS {
+                    return None;
+                }
+                Some(Fan {
+                    channel,
+                    name: Fan::name_for(channel),
+                    rpm,
+                    pwm: read_u32(&dir.join(format!("pwm{channel}"))),
+                })
             })
             .collect();
 
         // read_dir order is arbitrary; sort so the list does not jump around.
-        fans.sort_by_key(|(index, _)| *index);
-        fans.into_iter().map(|(_, fan)| fan).collect()
+        fans.sort_by_key(|fan| fan.channel);
+        fans
     }
 
     pub fn read_temps(&mut self) -> Temps {
@@ -144,6 +186,11 @@ fn read_hwmon_temp(path: &Path) -> Option<f32> {
     Some(milli as f32 / 1000.0)
 }
 
+/// Reads an integer hwmon node, or `None` if the channel does not exist.
+fn read_u32(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// Extracts `N` from a `fanN_input` file name.
 fn fan_input_index(file_name: &str) -> Option<u32> {
     file_name.strip_prefix("fan")?.strip_suffix("_input")?.parse().ok()
@@ -153,6 +200,14 @@ fn fan_input_index(file_name: &str) -> Option<u32> {
 fn nvidia_temp() -> Option<f32> {
     let out = command_stdout("nvidia-smi", &["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])?;
     out.lines().next()?.trim().parse().ok()
+}
+
+#[cfg(test)]
+impl Fan {
+    /// Convenience constructor for tests.
+    pub fn sample(channel: u32, rpm: u32) -> Self {
+        Self { channel, name: Self::name_for(channel), rpm, pwm: None }
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +228,15 @@ mod tests {
         let mut sensors = Sensors::new();
         let _ = sensors.read_fans();
         let _ = sensors.read_temps();
+    }
+
+    #[test]
+    fn fan_channels_carry_the_names_the_driver_documents() {
+        assert_eq!(Fan::name_for(1), "CPU fan");
+        assert_eq!(Fan::name_for(2), "GPU fan");
+        assert_eq!(Fan::name_for(3), "Fan 3");
+        assert_eq!(Fan::name_for(4), "Fan 4");
+        // Never panics on a channel number the kernel should not produce.
+        assert_eq!(Fan::name_for(0), "Fan 0");
     }
 }

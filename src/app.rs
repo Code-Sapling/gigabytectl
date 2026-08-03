@@ -6,8 +6,9 @@ use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
-    config::Config,
+    config::{self, Config, Profile},
     history::History,
+    notify::Notifier,
     sensors::{Fan, Sensors, Temps},
     sysfs::{self, HwState},
 };
@@ -30,12 +31,13 @@ pub enum Item {
     FanCurveView,
     FanCurveEdit,
     History,
+    Profiles,
     Refresh,
     Quit,
 }
 
 impl Item {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::FanMode,
         Self::FanCustomSpeed,
         Self::ChargeMode,
@@ -44,6 +46,7 @@ impl Item {
         Self::FanCurveView,
         Self::FanCurveEdit,
         Self::History,
+        Self::Profiles,
         Self::Refresh,
         Self::Quit,
     ];
@@ -58,6 +61,7 @@ impl Item {
             Self::FanCurveView => "Fan curve (View)",
             Self::FanCurveEdit => "Fan curve (Edit)",
             Self::History => "History graph",
+            Self::Profiles => "Profiles",
             Self::Refresh => "Refresh values",
             Self::Quit => "Quit",
         }
@@ -73,6 +77,7 @@ impl Item {
             Self::FanCurveView => "Shows a visual graph of the current fan curve",
             Self::FanCurveEdit => "Press Enter to edit the fan curve table",
             Self::History => "Live CPU/GPU temperature and fan RPM over time",
+            Self::Profiles => "Press Enter to apply, save, update, or delete saved profiles",
             Self::Refresh => "Reload all sysfs nodes",
             Self::Quit => "Exit the app",
         }
@@ -98,17 +103,26 @@ pub enum EditTarget {
     FanCustomSpeed,
     ChargeLimit,
     FanCurve(usize, CurveColumn),
+    /// Name for a profile saved from the current hardware state.
+    NewProfileName,
 }
 
 impl EditTarget {
-    /// The values the device accepts for this field.
-    pub fn range(self) -> RangeInclusive<i32> {
-        match self {
+    /// The values the device accepts for this field, for the numeric targets.
+    fn range(self) -> Option<RangeInclusive<i32>> {
+        Some(match self {
             Self::FanCustomSpeed => sysfs::FAN_SPEED_RANGE,
             Self::ChargeLimit => sysfs::CHARGE_LIMIT_RANGE,
             Self::FanCurve(_, CurveColumn::Temp) => sysfs::CURVE_TEMP_RANGE,
             Self::FanCurve(_, CurveColumn::Speed) => sysfs::CURVE_SPEED_RANGE,
-        }
+            Self::NewProfileName => return None,
+        })
+    }
+
+    /// Whether this field takes a number, which is also what the editor accepts
+    /// keystrokes for.
+    pub fn is_numeric(self) -> bool {
+        self.range().is_some()
     }
 
     pub fn prompt(self) -> String {
@@ -117,6 +131,15 @@ impl EditTarget {
             Self::ChargeLimit => "Enter charge limit".to_string(),
             Self::FanCurve(index, CurveColumn::Temp) => format!("Enter temp for idx {index}"),
             Self::FanCurve(index, CurveColumn::Speed) => format!("Enter speed for idx {index}"),
+            Self::NewProfileName => "Name for the new profile".to_string(),
+        }
+    }
+
+    /// What the editor tells the user is acceptable.
+    pub fn hint(self) -> String {
+        match self.range() {
+            Some(range) => format!("Allowed: {}..{}", range.start(), range.end()),
+            None => "Any name; Enter saves, Esc cancels".to_string(),
         }
     }
 }
@@ -127,6 +150,19 @@ pub enum Focus {
     Normal,
     Editing,
     FanCurveList,
+    ProfileList,
+    /// A yes/no question is on screen; nothing else takes keys until answered.
+    Confirm,
+}
+
+/// A destructive action held until the user confirms it.
+pub struct Confirm {
+    pub message: String,
+    action: ConfirmAction,
+}
+
+enum ConfirmAction {
+    DeleteProfile(String),
 }
 
 pub struct App {
@@ -141,6 +177,11 @@ pub struct App {
     pub curve_row: usize,
     pub curve_column: CurveColumn,
 
+    /// Saved profiles, sorted by name so the list order is stable.
+    pub profiles: Vec<(String, Profile)>,
+    pub profile_row: usize,
+    pub confirm: Option<Confirm>,
+
     pub fans: Vec<Fan>,
     pub temps: Temps,
     pub history: History,
@@ -148,6 +189,7 @@ pub struct App {
     pub last_refresh: Instant,
 
     sensors: Sensors,
+    notifier: Notifier,
 }
 
 impl App {
@@ -162,15 +204,112 @@ impl App {
             fan_curve: None,
             curve_row: 0,
             curve_column: CurveColumn::Temp,
+            profiles: Vec::new(),
+            profile_row: 0,
+            confirm: None,
             fans: Vec::new(),
             temps: Temps::default(),
             history: History::new(config.history_length),
-            config,
             last_refresh: Instant::now(),
             sensors: Sensors::new(),
+            notifier: Notifier::new(&config.notifications),
+            config,
         };
+        app.reload_profiles();
         app.refresh();
         app
+    }
+
+    /// Re-reads the profiles file. Failures leave the list empty rather than
+    /// taking down the UI.
+    fn reload_profiles(&mut self) {
+        match config::load_profiles() {
+            Ok(profiles) => {
+                let mut profiles: Vec<(String, Profile)> = profiles.into_iter().collect();
+                profiles.sort_by(|a, b| a.0.cmp(&b.0));
+                self.profiles = profiles;
+            }
+            Err(e) => {
+                self.profiles.clear();
+                self.set_status(format!("Could not load profiles: {e:#}"));
+            }
+        }
+        self.profile_row = self.profile_row.min(self.profiles.len().saturating_sub(1));
+    }
+
+    pub fn selected_profile(&self) -> Option<&(String, Profile)> {
+        self.profiles.get(self.profile_row)
+    }
+
+    /// Applies the selected profile, and follows it through to the system power
+    /// profile when the profile maps to one.
+    fn apply_selected_profile(&mut self) {
+        let Some((name, profile)) = self.selected_profile() else {
+            self.set_status("No profiles saved yet - press s to save the current settings");
+            return;
+        };
+        let (name, profile) = (name.clone(), profile.clone());
+
+        match profile.apply() {
+            Ok(()) => {
+                let mut message = format!("Applied profile '{name}'");
+                if let Some(power_profile) = &profile.ppd_profile {
+                    match crate::ppd::set(power_profile) {
+                        Ok(()) => message.push_str(&format!(", power profile -> {power_profile}")),
+                        Err(e) => message.push_str(&format!(" (power profile unchanged: {e})")),
+                    }
+                }
+                self.set_status(message);
+                self.refresh();
+            }
+            Err(e) => self.set_status(format!("{e:#}")),
+        }
+    }
+
+    /// Saves the current hardware state under `name`, replacing any profile
+    /// already using it.
+    fn save_profile(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.set_status("Profile name cannot be empty");
+            return;
+        }
+        let mut profiles: std::collections::HashMap<String, Profile> = self.profiles.iter().cloned().collect();
+        // Keep the power profile mapping when overwriting, since it is not
+        // something the hardware can report back.
+        let mut profile = Profile::from_hardware();
+        if let Some(existing) = profiles.get(name) {
+            profile.ppd_profile = existing.ppd_profile.clone();
+        }
+        let replaced = profiles.insert(name.to_string(), profile).is_some();
+
+        match config::save_profiles(&profiles) {
+            Ok(()) => {
+                self.set_status(format!("{} profile '{name}'", if replaced { "Updated" } else { "Saved" }));
+                self.reload_profiles();
+                if let Some(row) = self.profiles.iter().position(|(saved, _)| saved == name) {
+                    self.profile_row = row;
+                }
+            }
+            Err(e) => self.set_status(format!("{e:#}")),
+        }
+    }
+
+    fn delete_profile(&mut self, name: &str) {
+        let mut profiles: std::collections::HashMap<String, Profile> = self.profiles.iter().cloned().collect();
+        profiles.remove(name);
+        match config::save_profiles(&profiles) {
+            Ok(()) => {
+                self.set_status(format!("Deleted profile '{name}'"));
+                self.reload_profiles();
+            }
+            Err(e) => self.set_status(format!("{e:#}")),
+        }
+    }
+
+    fn ask(&mut self, message: impl Into<String>, action: ConfirmAction) {
+        self.confirm = Some(Confirm { message: message.into(), action });
+        self.focus = Focus::Confirm;
     }
 
     pub fn selected_item(&self) -> Item {
@@ -183,6 +322,7 @@ impl App {
         self.fans = self.sensors.read_fans();
         self.temps = self.sensors.read_temps();
         self.history.push(self.temps, &self.fans);
+        self.notifier.check(self.temps);
         if self.shows_fan_curve() {
             self.reload_fan_curve();
         }
@@ -221,6 +361,7 @@ impl App {
     fn cancel_edit(&mut self) {
         self.focus = match self.editing {
             Some(EditTarget::FanCurve(..)) => Focus::FanCurveList,
+            Some(EditTarget::NewProfileName) => Focus::ProfileList,
             _ => Focus::Normal,
         };
         self.editing = None;
@@ -231,6 +372,16 @@ impl App {
     /// the entry can be corrected.
     fn apply_edit(&mut self) {
         let Some(target) = self.editing else { return };
+        if target == EditTarget::NewProfileName {
+            let name = self.input.trim().to_string();
+            if name.is_empty() {
+                self.set_status("Profile name cannot be empty");
+                return;
+            }
+            self.cancel_edit();
+            self.save_profile(&name);
+            return;
+        }
         let Ok(value) = self.input.trim().parse::<i32>() else {
             self.set_status("Invalid number");
             return;
@@ -244,6 +395,8 @@ impl App {
                 sysfs::validate_charge_limit(value).and_then(|()| sysfs::write_value(sysfs::CHARGE_LIMIT, value))
             }
             EditTarget::FanCurve(index, column) => self.write_curve_value(index, column, value),
+            // Handled above; it does not take a number.
+            EditTarget::NewProfileName => return,
         };
 
         match result {
@@ -256,17 +409,17 @@ impl App {
         }
     }
 
-    /// Rewrites one curve point, keeping the column that was not edited.
+    /// Rewrites one curve point, keeping the column that was not edited and
+    /// refusing edits that would put the curve out of order.
     fn write_curve_value(&self, index: usize, column: CurveColumn, value: i32) -> Result<()> {
-        let &(temp, speed) = self
-            .fan_curve
-            .as_ref()
-            .and_then(|curve| curve.get(index))
-            .ok_or_else(|| anyhow!("Curve not loaded"))?;
-        match column {
-            CurveColumn::Temp => sysfs::write_fan_curve_point(index, value, speed),
-            CurveColumn::Speed => sysfs::write_fan_curve_point(index, temp, value),
-        }
+        let curve = self.fan_curve.as_ref().ok_or_else(|| anyhow!("Curve not loaded"))?;
+        let &(temp, speed) = curve.get(index).ok_or_else(|| anyhow!("Curve not loaded"))?;
+        let (temp, speed) = match column {
+            CurveColumn::Temp => (value, speed),
+            CurveColumn::Speed => (temp, value),
+        };
+        sysfs::validate_curve_point_in(curve, index, temp, speed)?;
+        sysfs::write_fan_curve_point(index, temp, speed)
     }
 
     /// Steps a named node forwards or backwards through `names`, wrapping around.
@@ -332,6 +485,8 @@ impl App {
         match self.focus {
             Focus::Editing => self.key_editing(key.code),
             Focus::FanCurveList => self.key_fan_curve(key.code),
+            Focus::ProfileList => self.key_profiles(key.code),
+            Focus::Confirm => self.key_confirm(key.code),
             Focus::Normal => return self.key_normal(key.code),
         }
         Flow::Continue
@@ -344,8 +499,13 @@ impl App {
             KeyCode::Backspace => {
                 self.input.pop();
             }
-            // Only digits: every editable node takes a non-negative number.
-            KeyCode::Char(c) if c.is_ascii_digit() => self.input.push(c),
+            // Numeric fields take digits only; the profile name takes text.
+            KeyCode::Char(c) if self.editing.is_some_and(EditTarget::is_numeric) => {
+                if c.is_ascii_digit() {
+                    self.input.push(c);
+                }
+            }
+            KeyCode::Char(c) if !c.is_control() => self.input.push(c),
             _ => {}
         }
     }
@@ -370,6 +530,52 @@ impl App {
         }
     }
 
+    fn key_profiles(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.focus = Focus::Normal,
+            KeyCode::Up => self.profile_row = self.profile_row.saturating_sub(1),
+            KeyCode::Down => {
+                self.profile_row = (self.profile_row + 1).min(self.profiles.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.apply_selected_profile(),
+            KeyCode::Char('s') => self.start_edit(EditTarget::NewProfileName, None),
+            KeyCode::Char('u') => match self.selected_profile() {
+                Some((name, _)) => {
+                    let name = name.clone();
+                    self.save_profile(&name);
+                }
+                None => self.set_status("No profile selected"),
+            },
+            KeyCode::Char('d') => match self.selected_profile() {
+                Some((name, _)) => {
+                    let name = name.clone();
+                    self.ask(format!("Delete profile '{name}'? [y/N]"), ConfirmAction::DeleteProfile(name));
+                }
+                None => self.set_status("No profile selected"),
+            },
+            _ => {}
+        }
+    }
+
+    fn key_confirm(&mut self, code: KeyCode) {
+        let confirmed = matches!(code, KeyCode::Char('y' | 'Y'));
+        let dismissed = confirmed || matches!(code, KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter);
+        if !dismissed {
+            return;
+        }
+
+        let pending = self.confirm.take();
+        self.focus = Focus::ProfileList;
+        let Some(confirm) = pending else { return };
+        if !confirmed {
+            self.set_status("Cancelled");
+            return;
+        }
+        match confirm.action {
+            ConfirmAction::DeleteProfile(name) => self.delete_profile(&name),
+        }
+    }
+
     fn key_normal(&mut self, code: KeyCode) -> Flow {
         match code {
             KeyCode::Char('q') => return Flow::Exit,
@@ -391,6 +597,10 @@ impl App {
             Item::FanCustomSpeed => self.start_edit(EditTarget::FanCustomSpeed, self.hw.fan_custom_speed),
             Item::ChargeLimit => self.start_edit(EditTarget::ChargeLimit, self.hw.charge_limit),
             Item::FanCurveEdit => self.open_fan_curve_editor(),
+            Item::Profiles => {
+                self.reload_profiles();
+                self.focus = Focus::ProfileList;
+            }
             Item::Refresh if enter => self.refresh_with_status(),
             Item::Quit if enter => return Flow::Exit,
             _ if enter => self.step_selected(1),
@@ -410,6 +620,9 @@ mod tests {
         let mut app = App::new(Config::default());
         app.hw = HwState::default();
         app.fan_curve = None;
+        // Whatever this machine has saved is not this test's business.
+        app.profiles.clear();
+        app.profile_row = 0;
         app
     }
 
@@ -503,6 +716,96 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.focus, Focus::FanCurveList);
         assert_eq!(app.editing, None);
+    }
+
+    #[test]
+    fn profile_list_navigation_and_prompts() {
+        let mut app = app();
+        app.selected = Item::ALL.iter().position(|i| *i == Item::Profiles).unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::ProfileList);
+
+        // Entering the list re-reads the profiles file, so stand in a known set
+        // only once that has happened.
+        app.profiles = vec![
+            ("balanced".to_string(), Profile::default()),
+            ("gaming".to_string(), Profile::default()),
+        ];
+        app.profile_row = 0;
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_profile().unwrap().0, "gaming");
+        // Selection stops at the end rather than wrapping or overflowing.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.profile_row, 1);
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.profile_row, 0);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Normal);
+    }
+
+    #[test]
+    fn saving_a_profile_prompts_for_a_name_as_free_text() {
+        let mut app = app();
+        app.focus = Focus::ProfileList;
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.editing, Some(EditTarget::NewProfileName));
+        assert!(app.input.is_empty(), "the name field starts empty");
+
+        for c in "my rig 2".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input, "my rig 2", "text targets accept letters and spaces");
+
+        // Escaping returns to the list, not the main menu.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::ProfileList);
+        assert_eq!(app.editing, None);
+    }
+
+    #[test]
+    fn deleting_a_profile_asks_first() {
+        let mut app = app();
+        app.profiles = vec![("gaming".to_string(), Profile::default())];
+        app.focus = Focus::ProfileList;
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.focus, Focus::Confirm);
+        assert!(app.confirm.as_ref().unwrap().message.contains("gaming"));
+
+        // Anything other than an answer leaves the question up.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.focus, Focus::Confirm);
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.focus, Focus::ProfileList);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.profiles.len(), 1, "declining must not delete anything");
+    }
+
+    #[test]
+    fn deleting_with_no_profiles_selected_is_harmless() {
+        let mut app = app();
+        app.profiles.clear();
+        app.focus = Focus::ProfileList;
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('u')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::ProfileList);
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn numeric_fields_still_reject_letters() {
+        let mut app = app();
+        app.selected = Item::ALL.iter().position(|i| *i == Item::ChargeLimit).unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        for c in "8a0".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input, "80");
     }
 
     #[test]

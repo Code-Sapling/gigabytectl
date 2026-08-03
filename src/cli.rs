@@ -1,6 +1,11 @@
 //! Command-line interface: argument definitions and one-shot commands.
 
-use std::{fs, io, path::Path, thread, time::Duration};
+use std::{
+    fs, io,
+    path::Path,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -9,8 +14,9 @@ use serde::Serialize;
 
 use crate::{
     config::{self, Config, Profile, Units},
+    notify::Notifier,
     ppd,
-    sensors::{Fan, Sensors},
+    sensors::{Fan, Sensors, Temps},
     sysfs::{self, HwState},
     system,
 };
@@ -82,6 +88,12 @@ pub enum Commands {
         /// Output as JSON, one object per line
         #[arg(long)]
         json: bool,
+        /// Output as CSV with a header line and a unix timestamp column
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
+        /// Stop after this many samples instead of running until interrupted
+        #[arg(short = 'n', long)]
+        count: Option<u64>,
     },
     /// Apply, list, or save profiles (~/.config/gigabytectl/profiles.toml)
     Profile(ProfileArgs),
@@ -92,6 +104,10 @@ pub enum Commands {
         #[arg(long)]
         once: bool,
     },
+    /// Read or change settings in config.toml
+    Config(ConfigArgs),
+    /// Report driver, sensor, and configuration state for this machine
+    Doctor,
     /// Generate shell completions (bash, zsh, fish, ...)
     Completions {
         /// Shell to generate completions for
@@ -112,6 +128,8 @@ impl Commands {
             self,
             Self::Monitor { .. }
                 | Self::Profile(_)
+                | Self::Config(_)
+                | Self::Doctor
                 | Self::Sync { .. }
                 | Self::Completions { .. }
                 | Self::InstallService
@@ -129,6 +147,48 @@ pub struct ProfileArgs {
     /// Save the current hardware settings as a new profile with this name
     #[arg(long, value_name = "NAME")]
     save: Option<String>,
+    /// Delete a saved profile
+    #[arg(long, value_name = "NAME")]
+    delete: Option<String>,
+    /// Print a saved profile
+    #[arg(long, value_name = "NAME")]
+    show: Option<String>,
+    /// power-profiles-daemon profile to map to, used with --save
+    #[arg(long, value_name = "PROFILE", requires = "save")]
+    ppd: Option<String>,
+    /// Copy profiles to /etc/gigabytectl so the root-run sync service sees them
+    #[arg(long)]
+    sync_system: bool,
+}
+
+#[derive(Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    action: ConfigAction,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Print the effective configuration
+    Show,
+    /// List the keys that can be read and written
+    Keys,
+    /// Print one value
+    Get { key: String },
+    /// Change one value
+    Set {
+        key: String,
+        value: String,
+        /// Write /etc/gigabytectl/config.toml instead of the user's config
+        #[arg(long)]
+        system: bool,
+    },
+    /// Print where the configuration is read from and written to
+    Path {
+        /// Show the system-wide path
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -168,7 +228,15 @@ pub enum FanCurveAction {
     /// Print one point (if index given) or the whole curve
     Get { index: Option<usize> },
     /// Set the (temp, speed) pair at an index (0..15)
-    Set { index: usize, temp: i32, speed: i32 },
+    Set {
+        index: usize,
+        temp: i32,
+        speed: i32,
+        /// Write even if it leaves the curve out of order (temperature and
+        /// speed are meant to be non-decreasing across points)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -245,6 +313,7 @@ pub fn run(command: Commands, config: &Config) -> Result<()> {
             ValueAction::Set { value } => {
                 sysfs::validate_fan_speed(value)?;
                 sysfs::write_value(sysfs::FAN_CUSTOM_SPEED, value)?;
+                warn_if_inactive(sysfs::Dependent::FanCustomSpeed);
             }
         },
         Commands::ChargeMode { action } => match action {
@@ -261,6 +330,7 @@ pub fn run(command: Commands, config: &Config) -> Result<()> {
             ValueAction::Set { value } => {
                 sysfs::validate_charge_limit(value)?;
                 sysfs::write_value(sysfs::CHARGE_LIMIT, value)?;
+                warn_if_inactive(sysfs::Dependent::ChargeLimit);
             }
         },
         Commands::GpuBoost { action } => match action {
@@ -277,8 +347,23 @@ pub fn run(command: Commands, config: &Config) -> Result<()> {
         Commands::FanPwm => println!("{}", sysfs::value_or_na(sysfs::read_i32(sysfs::FAN_PWM))),
         Commands::Fans => print_fans(&Sensors::new().read_fans()),
         Commands::FanCurve { action } => run_fan_curve(action)?,
-        Commands::Monitor { interval, json } => run_monitor(interval, json, config)?,
+        Commands::Monitor { interval, json, csv, count } => {
+            let format = if json {
+                SampleFormat::Json
+            } else if csv {
+                SampleFormat::Csv
+            } else {
+                SampleFormat::Text
+            };
+            run_monitor(interval, format, count, config)?;
+        }
         Commands::Profile(args) => run_profile(&args)?,
+        Commands::Config(args) => run_config(&args)?,
+        Commands::Doctor => {
+            if !crate::doctor::run()? {
+                std::process::exit(1);
+            }
+        }
         Commands::Sync { once } => run_sync(once)?,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -316,7 +401,19 @@ fn run_fan_curve(action: FanCurveAction) -> Result<()> {
                 println!("{index} {temp} {speed}");
             }
         }
-        FanCurveAction::Set { index, temp, speed } => sysfs::write_fan_curve_point(index, temp, speed)?,
+        FanCurveAction::Set { index, temp, speed, force } => {
+            if force {
+                sysfs::write_fan_curve_point(index, temp, speed)?;
+            } else {
+                // Check the edit against the curve already on the device, so a
+                // point cannot be dropped below its neighbours by accident.
+                sysfs::validate_curve_index(index)?;
+                let curve = sysfs::read_fan_curve()?;
+                sysfs::validate_curve_point_in(&curve, index, temp, speed)
+                    .context("refusing to write a fan curve that goes backwards (use --force to override)")?;
+                sysfs::write_fan_curve_point(index, temp, speed)?;
+            }
+        }
     }
     Ok(())
 }
@@ -326,7 +423,7 @@ fn print_fans(fans: &[Fan]) {
         println!("No live fan readings available");
     }
     for fan in fans {
-        println!("{}: {} RPM", fan.name, fan.rpm);
+        println!("{}: {}", fan.name, fan.reading());
     }
 }
 
@@ -343,6 +440,10 @@ struct StatusJson<'a> {
     fan_pwm: String,
     cpu_temp: Option<f64>,
     gpu_temp: Option<f64>,
+    /// False when the fan mode means fan_speed is currently ignored.
+    fan_speed_active: bool,
+    /// False when the charge mode means charge_limit is currently ignored.
+    charge_limit_active: bool,
     fans: Vec<FanJson<'a>>,
 }
 
@@ -356,14 +457,37 @@ struct SampleJson<'a> {
 
 #[derive(Serialize)]
 struct FanJson<'a> {
+    channel: u32,
     name: &'a str,
     rpm: u32,
+    pwm: Option<u32>,
 }
 
 fn fans_json(fans: &[Fan]) -> Vec<FanJson<'_>> {
     fans.iter()
-        .map(|fan| FanJson { name: &fan.name, rpm: fan.rpm })
+        .map(|fan| FanJson {
+            channel: fan.channel,
+            name: &fan.name,
+            rpm: fan.rpm,
+            pwm: fan.pwm,
+        })
         .collect()
+}
+
+/// `"80  (inactive - requires Custom charge mode)"` when a setting is inert.
+fn annotate(value: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{value}  (inactive - {reason})"),
+        None => value.to_string(),
+    }
+}
+
+/// Prints a warning when a value was written to a node that is currently being
+/// ignored, so a set that appears to work but does nothing is not silent.
+fn warn_if_inactive(setting: sysfs::Dependent) {
+    if let Some(reason) = HwState::read().inactive_reason(setting) {
+        eprintln!("Warning: value saved, but it has no effect right now - it {reason}");
+    }
 }
 
 fn print_status(json: bool, units: Units) -> Result<()> {
@@ -393,12 +517,16 @@ fn print_status(json: bool, units: Units) -> Result<()> {
             fan_pwm,
             cpu_temp: units.to_json(temps.cpu),
             gpu_temp: units.to_json(temps.gpu),
+            fan_speed_active: hw.is_active(sysfs::Dependent::FanCustomSpeed),
+            charge_limit_active: hw.is_active(sysfs::Dependent::ChargeLimit),
             fans: fans_json(&fans),
         };
         println!("{}", serde_json::to_string(&status).context("serializing status")?);
     } else {
         let cpu_temp = units.format(temps.cpu);
         let gpu_temp = units.format(temps.gpu);
+        let fan_speed = annotate(&fan_speed, hw.inactive_reason(sysfs::Dependent::FanCustomSpeed));
+        let charge_limit = annotate(&charge_limit, hw.inactive_reason(sysfs::Dependent::ChargeLimit));
         let rows: [(&str, &str); 10] = [
             ("Fan mode", &fan_mode),
             ("Fan speed", &fan_speed),
@@ -417,14 +545,21 @@ fn print_status(json: bool, units: Units) -> Result<()> {
         if !fans.is_empty() {
             println!("Fans:");
             for fan in &fans {
-                println!("  {}: {} RPM", fan.name, fan.rpm);
+                println!("  {}: {}", fan.name, fan.reading());
             }
         }
     }
     Ok(())
 }
 
-fn run_monitor(interval: Option<f64>, json: bool, config: &Config) -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SampleFormat {
+    Text,
+    Json,
+    Csv,
+}
+
+fn run_monitor(interval: Option<f64>, format: SampleFormat, count: Option<u64>, config: &Config) -> Result<()> {
     let period = match interval {
         Some(secs) => Duration::from_secs_f64(secs.max(0.1)),
         None => config.refresh_interval(),
@@ -432,32 +567,87 @@ fn run_monitor(interval: Option<f64>, json: bool, config: &Config) -> Result<()>
     let units = config.units;
     // Sensor paths are resolved once and reused for every sample.
     let mut sensors = Sensors::new();
+    let mut notifier = Notifier::new(&config.notifications);
+    // CSV columns are fixed by the first sample so the table stays rectangular
+    // even if a fan stops and drops out of later readings.
+    let mut csv_channels: Option<Vec<u32>> = None;
 
-    loop {
-        let temps = sensors.read_temps();
-        let fans = sensors.read_fans();
-
-        if json {
-            let sample = SampleJson {
-                cpu_temp: units.to_json(temps.cpu),
-                gpu_temp: units.to_json(temps.gpu),
-                fans: fans_json(&fans),
-            };
-            println!("{}", serde_json::to_string(&sample).context("serializing sample")?);
-        } else {
-            let readings = if fans.is_empty() {
-                "no fan data".to_string()
-            } else {
-                fans.iter()
-                    .map(|f| format!("{}: {} RPM", f.name, f.rpm))
-                    .collect::<Vec<_>>()
-                    .join("   ")
-            };
-            println!("CPU {}   GPU {}   {readings}", units.format(temps.cpu), units.format(temps.gpu));
+    for taken in 0.. {
+        if count.is_some_and(|limit| taken >= limit) {
+            return Ok(());
+        }
+        if taken > 0 {
+            thread::sleep(period);
         }
 
-        thread::sleep(period);
+        let temps = sensors.read_temps();
+        let fans = sensors.read_fans();
+        notifier.check(temps);
+
+        match format {
+            SampleFormat::Json => {
+                let sample = SampleJson {
+                    cpu_temp: units.to_json(temps.cpu),
+                    gpu_temp: units.to_json(temps.gpu),
+                    fans: fans_json(&fans),
+                };
+                println!("{}", serde_json::to_string(&sample).context("serializing sample")?);
+            }
+            SampleFormat::Csv => {
+                let channels = match &csv_channels {
+                    Some(channels) => channels,
+                    None => {
+                        let channels: Vec<u32> = fans.iter().map(|fan| fan.channel).collect();
+                        println!("{}", csv_header(&channels));
+                        csv_channels.insert(channels)
+                    }
+                };
+                println!("{}", csv_row(channels, temps, &fans, units));
+            }
+            SampleFormat::Text => {
+                let readings = if fans.is_empty() {
+                    "no fan data".to_string()
+                } else {
+                    fans.iter()
+                        .map(|f| format!("{}: {} RPM", f.name, f.rpm))
+                        .collect::<Vec<_>>()
+                        .join("   ")
+                };
+                println!("CPU {}   GPU {}   {readings}", units.format(temps.cpu), units.format(temps.gpu));
+            }
+        }
     }
+    Ok(())
+}
+
+fn csv_header(channels: &[u32]) -> String {
+    let mut columns = vec!["timestamp".to_string(), "cpu_temp".to_string(), "gpu_temp".to_string()];
+    for channel in channels {
+        columns.push(format!("fan{channel}_rpm"));
+        columns.push(format!("fan{channel}_pwm"));
+    }
+    columns.join(",")
+}
+
+fn csv_row(channels: &[u32], temps: Temps, fans: &[Fan], units: Units) -> String {
+    let number = |value: Option<f64>| value.map_or(String::new(), |v| format!("{v:.1}"));
+    let mut columns = vec![
+        unix_timestamp().to_string(),
+        number(units.to_json(temps.cpu)),
+        number(units.to_json(temps.gpu)),
+    ];
+    for channel in channels {
+        let fan = fans.iter().find(|fan| fan.channel == *channel);
+        columns.push(fan.map_or(String::new(), |fan| fan.rpm.to_string()));
+        columns.push(fan.and_then(|fan| fan.pwm).map_or(String::new(), |pwm| pwm.to_string()));
+    }
+    columns.join(",")
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 fn run_profile(args: &ProfileArgs) -> Result<()> {
@@ -467,9 +657,45 @@ fn run_profile(args: &ProfileArgs) -> Result<()> {
             "gigabytectl: saving a profile reads hardware state; run as root (try: sudo gigabytectl profile --save {name})"
         );
         let mut profiles = config::load_profiles()?;
-        profiles.insert(name.clone(), Profile::from_hardware());
+        let mut profile = Profile::from_hardware();
+        if let Some(power_profile) = &args.ppd {
+            profile.ppd_profile = Some(power_profile.clone());
+        }
+        let replaced = profiles.insert(name.clone(), profile).is_some();
         config::save_profiles(&profiles)?;
-        println!("Saved profile '{name}'");
+        println!("{} profile '{name}'", if replaced { "Updated" } else { "Saved" });
+        return Ok(());
+    }
+
+    if let Some(name) = &args.delete {
+        let mut profiles = config::load_profiles()?;
+        ensure!(
+            profiles.remove(name).is_some(),
+            "profile '{name}' not found in {}",
+            config::profiles_path().display()
+        );
+        config::save_profiles(&profiles)?;
+        println!("Deleted profile '{name}'");
+        return Ok(());
+    }
+
+    if let Some(name) = &args.show {
+        let profiles = config::load_profiles()?;
+        let profile = profiles
+            .get(name)
+            .with_context(|| format!("profile '{name}' not found in {}", config::profiles_path().display()))?;
+        print!("{}", toml::to_string_pretty(profile).context("serializing profile")?);
+        return Ok(());
+    }
+
+    if args.sync_system {
+        ensure!(
+            system::is_root(),
+            "gigabytectl: writing {} needs root (try: sudo gigabytectl profile --sync-system)",
+            config::SYSTEM_CONFIG_DIR
+        );
+        let path = config::seed_system_profiles()?;
+        println!("Copied profiles to {}", path.display());
         return Ok(());
     }
 
@@ -488,7 +714,7 @@ fn run_profile(args: &ProfileArgs) -> Result<()> {
     }
 
     let Some(name) = &args.name else {
-        bail!("Specify a profile to apply, or use --list / --save <name>");
+        bail!("Specify a profile to apply, or use --list / --save / --show / --delete <name>");
     };
 
     require_hardware()?;
@@ -505,6 +731,38 @@ fn run_profile(args: &ProfileArgs) -> Result<()> {
             Ok(()) => println!("Set power profile -> {power_profile}"),
             Err(e) => eprintln!("Warning: {e:#}"),
         }
+    }
+    Ok(())
+}
+
+fn run_config(args: &ConfigArgs) -> Result<()> {
+    match &args.action {
+        ConfigAction::Show => {
+            let config = Config::load();
+            print!("{}", toml::to_string_pretty(&config).context("serializing config")?);
+        }
+        ConfigAction::Keys => {
+            for key in Config::KEYS {
+                println!("{key}");
+            }
+        }
+        ConfigAction::Get { key } => println!("{}", Config::load().get(key)?),
+        ConfigAction::Set { key, value, system } => {
+            if *system {
+                ensure!(
+                    crate::system::is_root(),
+                    "gigabytectl: writing {} needs root (try: sudo gigabytectl config set --system {key} {value})",
+                    config::config_path(true).display()
+                );
+            }
+            // Edit the file being written rather than the merged view, so a
+            // system-wide value is not silently copied into the user's config.
+            let mut config = config::load_config_file(&config::config_path(*system));
+            config.set(key, value)?;
+            let path = config::save_config(&config, *system)?;
+            println!("{key} = {} ({})", config.get(key)?, path.display());
+        }
+        ConfigAction::Path { system } => println!("{}", config::config_path(*system).display()),
     }
     Ok(())
 }
@@ -545,8 +803,8 @@ fn apply_mapped_profile(power_profile: &str) -> Result<()> {
     Ok(())
 }
 
-const SERVICE_NAME: &str = "gigabytectl-ppd-sync.service";
-const SERVICE_PATH: &str = "/etc/systemd/system/gigabytectl-ppd-sync.service";
+pub const SERVICE_NAME: &str = "gigabytectl-ppd-sync.service";
+pub const SERVICE_PATH: &str = "/etc/systemd/system/gigabytectl-ppd-sync.service";
 
 /// Installs and enables the systemd sync service. Because the service runs as
 /// root (no `SUDO_USER`, `HOME=/root`), it can't see profiles in a user's home,
@@ -640,7 +898,8 @@ mod tests {
         assert!(Commands::Status { json: false }.needs_hardware());
         assert!(Commands::BatteryCycle.needs_hardware());
         assert!(Commands::Fans.needs_hardware());
-        assert!(!Commands::Monitor { interval: None, json: false }.needs_hardware());
+        assert!(!Commands::Monitor { interval: None, json: false, csv: false, count: None }.needs_hardware());
+        assert!(!Commands::Doctor.needs_hardware());
         assert!(!Commands::Completions { shell: Shell::Bash }.needs_hardware());
         assert!(!Commands::InstallService.needs_hardware());
     }
@@ -676,19 +935,21 @@ mod tests {
             fan_pwm: "160".into(),
             cpu_temp: Some(58.5),
             gpu_temp: None,
-            fans: vec![FanJson { name: "Fan 1", rpm: 2400 }],
+            fan_speed_active: true,
+            charge_limit_active: false,
+            fans: vec![FanJson { channel: 1, name: "CPU fan", rpm: 2400, pwm: Some(60) }],
         };
         assert_eq!(
             serde_json::to_string(&status).unwrap(),
-            r#"{"fan_mode":"gaming","fan_speed":"200","charge_mode":"custom","charge_limit":"80","gpu_boost":"on","battery_cycle":"12","light_sensor":"N/A","fan_pwm":"160","cpu_temp":58.5,"gpu_temp":null,"fans":[{"name":"Fan 1","rpm":2400}]}"#
+            r#"{"fan_mode":"gaming","fan_speed":"200","charge_mode":"custom","charge_limit":"80","gpu_boost":"on","battery_cycle":"12","light_sensor":"N/A","fan_pwm":"160","cpu_temp":58.5,"gpu_temp":null,"fan_speed_active":true,"charge_limit_active":false,"fans":[{"channel":1,"name":"CPU fan","rpm":2400,"pwm":60}]}"#
         );
     }
 
     #[test]
     fn fan_names_with_quotes_stay_valid_json() {
-        let fans = [Fan { name: "Fan \"1\"\n".to_string(), rpm: 1 }];
+        let fans = [Fan { name: "Fan \"1\"\n".to_string(), ..Fan::sample(1, 1) }];
         let encoded = serde_json::to_string(&fans_json(&fans)).unwrap();
-        assert_eq!(encoded, r#"[{"name":"Fan \"1\"\n","rpm":1}]"#);
+        assert_eq!(encoded, r#"[{"channel":1,"name":"Fan \"1\"\n","rpm":1,"pwm":null}]"#);
     }
 
     #[test]

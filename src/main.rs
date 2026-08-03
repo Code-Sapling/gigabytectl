@@ -6,7 +6,9 @@
 mod app;
 mod cli;
 mod config;
+mod doctor;
 mod history;
+mod notify;
 mod ppd;
 mod sensors;
 mod sysfs;
