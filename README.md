@@ -245,7 +245,7 @@ sudo gigabytectl install-service
 
 This writes the unit (pointing `ExecStart` at your actual binary), enables and starts it, and copies your profiles to `/etc/gigabytectl/profiles.toml`.
 
-> **Why the copy?** The service runs as `root` under systemd, where `$SUDO_USER` is unset and `$HOME` is `/root`, so it can't see profiles saved in your home directory. gigabytectl reads `~/.config/gigabytectl/profiles.toml` first and falls back to `/etc/gigabytectl/profiles.toml`, which is where the service looks. After changing profiles, re-run `sudo gigabytectl install-service` (or edit the `/etc` copy directly) to update what the service applies.
+> **Why the copy?** The service runs as `root` under systemd, where `$SUDO_USER` is unset and `$HOME` is `/root`, so it can't see profiles saved in your home directory. gigabytectl reads `~/.config/gigabytectl/profiles.toml` first and falls back to `/etc/gigabytectl/profiles.toml`, which is where the service looks. After changing profiles, run `sudo gigabytectl profile --sync-system` to update what the service applies.
 
 You can also install the unit by hand (adjust `ExecStart` if `gigabytectl` isn't in `/usr/local/bin`):
 
@@ -318,9 +318,9 @@ If you find any problems or bugs, feel free to open an issue. Feedback and impro
 
 - After updating **gigabytectl**, regenerate your [shell completions](https://github.com/Code-Sapling/gigabytectl#%EF%B8%8F-shell-completions).
 
-- After modifying `~/.config/gigabytectl/profiles.toml`, reinstall the systemd service and update `/etc/gigabytectl/profiles.toml`:
+- After modifying `~/.config/gigabytectl/profiles.toml`, update `/etc/gigabytectl/profiles.toml`:
   ```bash
-  sudo gigabytectl install-service
+  sudo gigabytectl profile --sync-system
   ```
 
 - Keep **gigabytectl** and **gigabyte-laptop-wmi** in sync. Whenever you update one, it's recommended to update the other to ensure compatibility.
