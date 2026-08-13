@@ -1,18 +1,21 @@
 [Unit]
-Description=gigabytectl power-profiles-daemon sync
+Description=gigabytectl power-profiles-daemon sync and temperature alerts
 Documentation=https://github.com/Code-Sapling/gigabytectl
-# Apply the mapped gigabytectl profile whenever the system power profile changes.
+# Apply the mapped gigabytectl profile whenever the system power profile changes,
+# and raise temperature alerts when notifications are enabled in the config.
 After=power-profiles-daemon.service
 Wants=power-profiles-daemon.service
 
 [Service]
 Type=simple
 # Adjust the path if you installed elsewhere (e.g. /usr/bin/gigabytectl).
-# This runs as root, so it reads profiles from /etc/gigabytectl/profiles.toml
+# This runs as root, so it reads profiles and settings from /etc/gigabytectl
 # (not any user's ~/.config). `gigabytectl install-service` sets this up for you.
 ExecStart=/usr/local/bin/gigabytectl sync
 Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=power-profiles-daemon.service
+# multi-user.target so temperature alerts still run on machines without
+# power-profiles-daemon; the PPD unit so sync starts with it when it is there.
+WantedBy=multi-user.target power-profiles-daemon.service

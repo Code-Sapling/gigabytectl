@@ -10,6 +10,7 @@ mod doctor;
 mod history;
 mod notify;
 mod ppd;
+mod selfcmd;
 mod sensors;
 mod sysfs;
 mod system;

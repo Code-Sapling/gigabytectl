@@ -4,15 +4,21 @@
 //! sensor so a machine sitting above its threshold does not spam the session.
 
 use std::{
+    fs,
     process::{Child, Command, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
 use crate::{
     config::Notifications,
-    sensors::Temps,
+    sensors::{Sensors, Temps},
     system::{self, command_stdout},
 };
+
+/// Where per-user runtime state lives. A `bus` socket under it means that user
+/// has a session a notification can be delivered to.
+const RUNTIME_ROOT: &str = "/run/user";
 
 /// Which sensor an alert came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,12 +36,31 @@ impl Source {
     }
 }
 
+/// Polls the sensors until the process is stopped, alerting on anything over
+/// its threshold. This is what lets the sync service raise alerts without the
+/// TUI being open; it never returns.
+pub fn watch(config: &Notifications) -> ! {
+    let period = config.poll_interval();
+    let mut sensors = Sensors::new();
+    let mut notifier = Notifier::new(config);
+    eprintln!(
+        "gigabytectl: watching temperatures every {}s (CPU >= {:.0}C, GPU >= {:.0}C)",
+        period.as_secs(),
+        config.cpu_temp,
+        config.gpu_temp
+    );
+    loop {
+        notifier.check(sensors.read_temps());
+        thread::sleep(period);
+    }
+}
+
 pub struct Notifier {
     config: Notifications,
     /// When each sensor last raised an alert.
     last: [Option<Instant>; 2],
-    /// The most recent `notify-send`, kept only so it can be reaped.
-    pending: Option<Child>,
+    /// Notifications still running, kept only so they can be reaped.
+    pending: Vec<Child>,
     /// Under test the message is recorded instead of being sent, so running the
     /// suite does not pop notifications onto the developer's desktop.
     #[cfg(test)]
@@ -47,7 +72,7 @@ impl Notifier {
         Self {
             config: config.clone(),
             last: [None; 2],
-            pending: None,
+            pending: Vec::new(),
             #[cfg(test)]
             sent: Vec::new(),
         }
@@ -86,42 +111,56 @@ impl Notifier {
         self.sent.push((summary, body));
         #[cfg(not(test))]
         {
-            self.pending = spawn_notification(&summary, &body);
+            self.pending = spawn_notifications(&summary, &body);
         }
     }
 
-    /// Collects the previous notification process so finished ones do not pile
-    /// up as zombies over a long session.
+    /// Drops the notification processes that have finished so they do not pile
+    /// up as zombies over the lifetime of a service.
     fn reap(&mut self) {
-        if let Some(child) = &mut self.pending
-            && matches!(child.try_wait(), Ok(Some(_)) | Err(_))
-        {
-            self.pending = None;
-        }
+        self.pending.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 }
 
-/// Starts `notify-send` without waiting for it.
-///
-/// Under `sudo` the notification has to be delivered to the invoking user's
-/// session bus, since root's own bus is not what the desktop is listening on.
-/// If that user cannot be resolved, the alert is skipped rather than lost in
-/// root's session.
-#[cfg_attr(test, allow(dead_code, reason = "only called outside test builds"))]
-fn spawn_notification(summary: &str, body: &str) -> Option<Child> {
-    let mut command = match session_target() {
-        Some((user, uid)) => {
-            let mut command = Command::new("sudo");
-            command
-                .arg("-u")
-                .arg(&user)
-                .arg(format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"))
-                .arg("notify-send");
-            command
-        }
-        None => Command::new("notify-send"),
-    };
+/// A logged-in user a notification can be delivered to.
+struct Session {
+    /// Name accepted by `sudo -u`, or `#<uid>` when it cannot be resolved.
+    user: String,
+    uid: u32,
+}
 
+/// Whose desktop an alert should be shown on.
+enum Delivery {
+    /// This process's own session bus.
+    Own,
+    /// Other users' session buses, because we are root and root's bus is not
+    /// what the desktop is listening on.
+    Sessions(Vec<Session>),
+}
+
+/// Starts a `notify-send` per target without waiting for any of them.
+#[cfg_attr(test, allow(dead_code, reason = "only called outside test builds"))]
+fn spawn_notifications(summary: &str, body: &str) -> Vec<Child> {
+    match delivery() {
+        Delivery::Own => spawn(Command::new("notify-send"), summary, body).into_iter().collect(),
+        Delivery::Sessions(sessions) => sessions
+            .iter()
+            .filter_map(|session| {
+                let mut command = Command::new("sudo");
+                command
+                    .arg("-u")
+                    .arg(&session.user)
+                    .arg(format!("DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME_ROOT}/{}/bus", session.uid))
+                    .arg(format!("XDG_RUNTIME_DIR={RUNTIME_ROOT}/{}", session.uid))
+                    .arg("notify-send");
+                spawn(command, summary, body)
+            })
+            .collect(),
+    }
+}
+
+#[cfg_attr(test, allow(dead_code, reason = "only called outside test builds"))]
+fn spawn(mut command: Command, summary: &str, body: &str) -> Option<Child> {
     command
         .args(["--app-name=gigabytectl", "--urgency=critical", summary, body])
         .stdin(Stdio::null())
@@ -131,16 +170,62 @@ fn spawn_notification(summary: &str, body: &str) -> Option<Child> {
         .ok()
 }
 
-/// The `(user, uid)` whose session should receive notifications, or `None` when
-/// we are already that user.
+/// Works out who should see the alert.
+///
+/// Run by hand it is simply this session. Under `sudo` it is the invoking user.
+/// As a system service there is no invoking user, so every logged-in session
+/// gets it — that is the case that lets the sync service notify a desktop.
 #[cfg_attr(test, allow(dead_code, reason = "only called outside test builds"))]
-fn session_target() -> Option<(String, u32)> {
+fn delivery() -> Delivery {
     if !system::is_root() {
-        return None;
+        return Delivery::Own;
     }
-    let user = system::sudo_user()?;
-    let uid = command_stdout("id", &["-u", &user])?.parse().ok()?;
-    Some((user, uid))
+    if let Some(user) = system::sudo_user()
+        && let Some(uid) = command_stdout("id", &["-u", &user]).and_then(|uid| uid.parse().ok())
+    {
+        return Delivery::Sessions(vec![Session { user, uid }]);
+    }
+    Delivery::Sessions(active_sessions())
+}
+
+/// Users with a running session bus. The user's own systemd instance creates
+/// `/run/user/<uid>/bus` at login, so reading the directory needs no extra
+/// tools and no D-Bus round trip.
+#[cfg_attr(test, allow(dead_code, reason = "only called outside test builds"))]
+fn active_sessions() -> Vec<Session> {
+    let Ok(entries) = fs::read_dir(RUNTIME_ROOT) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<Session> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let uid = runtime_dir_uid(&entry.file_name().to_string_lossy())?;
+            entry
+                .path()
+                .join("bus")
+                .exists()
+                .then(|| Session { user: user_name(uid), uid })
+        })
+        .collect();
+    // read_dir order is arbitrary; keep delivery order stable.
+    sessions.sort_by_key(|session| session.uid);
+    sessions
+}
+
+/// The uid a `/run/user` entry belongs to. Anything that is not a plain number
+/// is not a runtime directory.
+fn runtime_dir_uid(name: &str) -> Option<u32> {
+    name.parse().ok()
+}
+
+/// The login name for a uid, falling back to the `#<uid>` form `sudo -u`
+/// accepts when the passwd database cannot be read.
+#[cfg_attr(test, allow(dead_code, reason = "only called outside test builds"))]
+fn user_name(uid: u32) -> String {
+    command_stdout("getent", &["passwd", &uid.to_string()])
+        .and_then(|entry| entry.split(':').next().map(str::to_string))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("#{uid}"))
 }
 
 #[cfg(test)]
@@ -210,9 +295,18 @@ mod tests {
             cpu_temp: 1.0,
             gpu_temp: 1.0,
             cooldown_secs: 0,
+            ..Default::default()
         };
         let mut notifier = Notifier::new(&config);
         notifier.check(Temps::default());
         assert!(notifier.last.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn only_numeric_runtime_directories_are_treated_as_sessions() {
+        assert_eq!(runtime_dir_uid("1000"), Some(1000));
+        assert_eq!(runtime_dir_uid("0"), Some(0));
+        assert_eq!(runtime_dir_uid("gdm"), None);
+        assert_eq!(runtime_dir_uid(""), None);
     }
 }

@@ -18,7 +18,8 @@ See More:
 - Warns when a setting is inert (e.g. a charge limit with charging mode set to Normal)
 - Refuses fan curves that go backwards, which the hardware does not expect
 - `doctor` reports what the driver exposes on your specific model
-- Optional temperature notifications (off by default)
+- Optional temperature notifications (off by default), raised by the background service so nothing has to stay open
+- `self update` / `self uninstall` to manage the installation from the tool itself
 - Scriptable headless/CLI mode for automation, including a `monitor` mode
 - Shell completions for bash, zsh, and fish
 - Configurable defaults (refresh interval, temperature units)
@@ -128,10 +129,14 @@ gigabytectl config show                   # effective settings
 gigabytectl config set units fahrenheit   # change one setting
 
 sudo gigabytectl sync --once              # apply profile mapped to current power profile
-sudo gigabytectl sync                     # watch power-profiles-daemon and sync (see below)
+sudo gigabytectl sync                     # background service: power profile sync + temperature alerts
+
+gigabytectl self update --check           # is there a newer release?
+sudo gigabytectl self update              # download and install it
+sudo gigabytectl self uninstall           # remove the binary, config, and service
 ```
 
-`monitor`, `doctor`, `config`, `completions`, and `profile --list` are read-only and do not require root. The other subcommands read from or write to `/sys` and require `sudo`; they exit with a clear error (rather than an interactive prompt) if not run as root, so they are safe to use in scripts.
+`monitor`, `doctor`, `config`, `completions`, `self update --check`, and `profile --list` are read-only and do not require root. The other subcommands read from or write to `/sys` and require `sudo`; they exit with a clear error (rather than an interactive prompt) if not run as root, so they are safe to use in scripts.
 
 Run `gigabytectl --help` or `gigabytectl <command> --help` for the full list of commands and options.
 
@@ -191,6 +196,7 @@ enabled = false
 cpu_temp = 90.0              # threshold in degrees Celsius, whatever `units` displays
 gpu_temp = 90.0
 cooldown_secs = 300          # minimum gap between alerts for the same sensor
+poll_interval_secs = 10      # how often the background service samples temperatures
 ```
 
 Edit it by hand, or with the `config` subcommand:
@@ -207,6 +213,29 @@ Settings are read from `~/.config/gigabytectl/config.toml` first, then
 `/etc/gigabytectl/config.toml`, so the root-run sync service can be configured too.
 
 > When run under `sudo`, config is resolved from the invoking user's home (via `$SUDO_USER`), not root's, so `~/.config/gigabytectl` is the same whether or not you use `sudo`.
+
+### 🔔 Temperature alerts
+
+Alerts are **opt-in** and off until you switch them on:
+
+```bash
+sudo gigabytectl config set notifications.enabled true
+sudo gigabytectl config set notifications.cpu_temp 85
+```
+
+They are raised in two places:
+
+- **In the TUI and `monitor`**, on the samples those already take — only while they are running.
+- **In the [background service](#-power-profiles-daemon-sync)**, which polls every `poll_interval_secs` — so alerts keep working with nothing open.
+
+The service runs as root and delivers each alert to every logged-in desktop session (it looks for a session bus under `/run/user/<uid>`), using `notify-send`. It reads its settings from `/etc/gigabytectl/config.toml`, which `install-service` seeds from yours; running `sudo gigabytectl config set ...` afterwards keeps that copy up to date. Use `sudo` when changing these settings, or the system copy the service reads is left behind:
+
+```bash
+sudo gigabytectl config set notifications.enabled true
+sudo systemctl restart gigabytectl-ppd-sync.service   # pick the change up now
+```
+
+> Alerts need `notify-send` (`libnotify`) and a notification daemon in your desktop session. Each sensor is rate-limited to one alert per `cooldown_secs`, so a machine sitting above its threshold does not spam you.
 
 ## 🔋 Power Profiles Daemon Sync
 
@@ -243,7 +272,14 @@ To run the watcher automatically at boot, install the systemd service:
 sudo gigabytectl install-service
 ```
 
-This writes the unit (pointing `ExecStart` at your actual binary), enables and starts it, and copies your profiles to `/etc/gigabytectl/profiles.toml`.
+This writes the unit (pointing `ExecStart` at your actual binary), enables and starts it, and copies your profiles and settings to `/etc/gigabytectl/`.
+
+The service does two jobs, and either one on its own is reason enough to run it:
+
+- applies the mapped profile whenever the system power profile changes;
+- raises [temperature alerts](#-temperature-alerts), if you have switched them on.
+
+So on a machine without `power-profiles-daemon` it still runs, for the alerts alone.
 
 > **Why the copy?** The service runs as `root` under systemd, where `$SUDO_USER` is unset and `$HOME` is `/root`, so it can't see profiles saved in your home directory. gigabytectl reads `~/.config/gigabytectl/profiles.toml` first and falls back to `/etc/gigabytectl/profiles.toml`, which is where the service looks. After changing profiles, run `sudo gigabytectl profile --sync-system` to update what the service applies.
 
@@ -273,33 +309,38 @@ gigabytectl completions fish > ~/.config/fish/completions/gigabytectl.fish
 
 ## 🧹 Uninstall
 
-If installed system-wide:
-
 ```bash
-sudo rm /usr/local/bin/gigabytectl
+sudo gigabytectl self uninstall --dry-run   # list exactly what would go
+sudo gigabytectl self uninstall             # asks for confirmation first
 ```
 
-If installed via Cargo:
+This disables and removes the systemd service, deletes `/etc/gigabytectl` and every user's `~/.config/gigabytectl`, removes the shell completions installed at the documented paths, and finally removes the binary itself. Options:
 
-```bash
-sudo cargo uninstall gigabytectl --root /usr/local
-```
+- `--dry-run` — print the list and stop, changing nothing (works without root)
+- `--yes` / `-y` — skip the confirmation prompt (required when not on a terminal)
+- `--keep-config` — remove the program and service, keep your profiles and settings
 
+> If the binary belongs to a distro package (`pacman`, `dpkg`), it is left in place and named in the output — remove it with your package manager. For a `cargo install`, run `cargo uninstall gigabytectl` afterwards to tidy its metadata.
 
 ## ↻ Update
 
-### Method 1: 🦀 Using Cargo
+```bash
+gigabytectl self update --check     # just report whether a newer release exists
+sudo gigabytectl self update        # download and install it
+```
+
+`self update` compares your version against the latest GitHub release, downloads the tarball for your architecture, checks that the new binary runs and reports the expected version, then swaps it in atomically. If the sync service is running the binary being replaced, it is restarted for you.
+
+- `--check` — only look; never downloads or installs
+- `--dry-run` — also print the download URL and install path, then stop
+
+> `self update` needs `curl` and `tar`, and root if the binary lives somewhere like `/usr/local/bin`. It refuses to touch a binary owned by a distro package.
+
+If you installed with Cargo, you can also update the usual way:
 
 ```bash
 sudo cargo install gigabytectl --root /usr/local --force
 ```
-
-### Method 2: 📦 Prebuilt Binary (GitHub Releases)
-
-If you installed using a prebuilt binary, simply:
-
-- [Uninstall](https://github.com/Code-Sapling/gigabytectl#-uninstall)
-- [Reinstall](https://github.com/Code-Sapling/gigabytectl#method-2--prebuilt-binary-github-releases)
 
 ## 💻 Compatibility
 
@@ -321,6 +362,11 @@ If you find any problems or bugs, feel free to open an issue. Feedback and impro
 - After modifying `~/.config/gigabytectl/profiles.toml`, update `/etc/gigabytectl/profiles.toml`:
   ```bash
   sudo gigabytectl profile --sync-system
+  ```
+
+- After changing settings the [background service](#-power-profiles-daemon-sync) acts on (the `[notifications]` block), restart it so it picks them up:
+  ```bash
+  sudo systemctl restart gigabytectl-ppd-sync.service
   ```
 
 - Keep **gigabytectl** and **gigabyte-laptop-wmi** in sync. Whenever you update one, it's recommended to update the other to ensure compatibility.

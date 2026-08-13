@@ -13,9 +13,9 @@ use clap_complete::{Shell, generate};
 use serde::Serialize;
 
 use crate::{
-    config::{self, Config, Profile, Units},
-    notify::Notifier,
-    ppd,
+    config::{self, Config, Notifications, Profile, Units},
+    notify::{self, Notifier},
+    ppd, selfcmd,
     sensors::{Fan, Sensors, Temps},
     sysfs::{self, HwState},
     system,
@@ -97,8 +97,9 @@ pub enum Commands {
     },
     /// Apply, list, or save profiles (~/.config/gigabytectl/profiles.toml)
     Profile(ProfileArgs),
-    /// Sync with power-profiles-daemon: apply the mapped profile whenever the
-    /// system power profile changes. Runs until interrupted (for a systemd service).
+    /// Background service: apply the mapped profile whenever the system power
+    /// profile changes, and raise temperature alerts if they are switched on.
+    /// Runs until interrupted (for a systemd service).
     Sync {
         /// Apply the profile mapped to the current power profile once, then exit
         #[arg(long)]
@@ -113,10 +114,41 @@ pub enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
-    /// Install and enable the power-profiles-daemon sync systemd service.
-    /// Seeds /etc/gigabytectl/profiles.toml from your profiles so the
-    /// root-run service can find them (run with sudo).
+    /// Install and enable the sync systemd service. Seeds
+    /// /etc/gigabytectl/{profiles,config}.toml from yours so the root-run
+    /// service can find them (run with sudo).
     InstallService,
+    /// Manage this installation itself (update or uninstall)
+    #[command(name = "self")]
+    Manage {
+        #[command(subcommand)]
+        action: ManageAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ManageAction {
+    /// Check GitHub for a newer release and install it over this binary
+    Update {
+        /// Only report whether an update is available
+        #[arg(long)]
+        check: bool,
+        /// Report what would be downloaded and installed, without doing it
+        #[arg(long, conflicts_with = "check")]
+        dry_run: bool,
+    },
+    /// Remove the binary, its configuration, and the systemd service
+    Uninstall {
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// List what would be removed, without removing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep configuration and profiles
+        #[arg(long)]
+        keep_config: bool,
+    },
 }
 
 impl Commands {
@@ -133,6 +165,7 @@ impl Commands {
                 | Self::Sync { .. }
                 | Self::Completions { .. }
                 | Self::InstallService
+                | Self::Manage { .. }
         )
     }
 }
@@ -364,13 +397,17 @@ pub fn run(command: Commands, config: &Config) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Sync { once } => run_sync(once)?,
+        Commands::Sync { once } => run_sync(once, config)?,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             generate(shell, &mut cmd, name, &mut io::stdout());
         }
         Commands::InstallService => install_service()?,
+        Commands::Manage { action } => match action {
+            ManageAction::Update { check, dry_run } => selfcmd::update(check, dry_run)?,
+            ManageAction::Uninstall { yes, dry_run, keep_config } => selfcmd::uninstall(yes, dry_run, keep_config)?,
+        },
     }
     Ok(())
 }
@@ -767,17 +804,37 @@ fn run_config(args: &ConfigArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_sync(once: bool) -> Result<()> {
+/// The long-running service: PPD sync plus, when they are switched on,
+/// temperature alerts. Running the alerts here is what frees them from the TUI,
+/// so they keep working with nothing open.
+fn run_sync(once: bool, config: &Config) -> Result<()> {
     require_hardware()?;
+    let notifications = &config.notifications;
+    let ppd_available = ppd::is_available();
+    const NO_PPD: &str = "power-profiles-daemon is not available on the system bus (is it installed and running?)";
+
+    if once {
+        // Apply whatever profile is active right now, then stop.
+        ensure!(ppd_available, "{NO_PPD}");
+        return apply_mapped_profile(&ppd::get()?);
+    }
+
+    // Alerts alone are a legitimate reason to run this service, so PPD is only
+    // required when there would otherwise be nothing to do.
     ensure!(
-        ppd::is_available(),
-        "power-profiles-daemon is not available on the system bus (is it installed and running?)"
+        ppd_available || notifications.enabled,
+        "{NO_PPD}\nTurn on temperature alerts (gigabytectl config set notifications.enabled true) to run this service for alerts alone."
     );
 
+    if !ppd_available {
+        eprintln!("gigabytectl: power-profiles-daemon not reachable; running temperature alerts only");
+        notify::watch(notifications);
+    }
+
+    start_notifier(notifications);
     // Start from whatever profile is active right now.
-    apply_mapped_profile(&ppd::get()?)?;
-    if once {
-        return Ok(());
+    if let Err(e) = apply_mapped_profile(&ppd::get()?) {
+        eprintln!("Warning: {e:#}");
     }
 
     ppd::watch(|power_profile| {
@@ -785,6 +842,16 @@ fn run_sync(once: bool) -> Result<()> {
             eprintln!("Warning: {e:#}");
         }
     })
+}
+
+/// Polls temperatures alongside the PPD watch, which blocks for the life of the
+/// service. Does nothing unless alerts are switched on — they stay opt-in.
+fn start_notifier(notifications: &Notifications) {
+    if !notifications.enabled {
+        return;
+    }
+    let notifications = notifications.clone();
+    thread::spawn(move || notify::watch(&notifications));
 }
 
 /// Applies the gigabytectl profile mapped to `power_profile` (hardware only —
@@ -820,6 +887,7 @@ fn install_service() -> Result<()> {
     let exe = fs::canonicalize(&exe).unwrap_or(exe);
 
     seed_system_profiles()?;
+    seed_system_config()?;
 
     fs::write(SERVICE_PATH, service_unit(&exe)).with_context(|| format!("writing {SERVICE_PATH}"))?;
     eprintln!("Wrote {SERVICE_PATH}");
@@ -828,6 +896,25 @@ fn install_service() -> Result<()> {
     system::checked_status("systemctl", &["enable", "--now", SERVICE_NAME])?;
     eprintln!("Enabled and started {SERVICE_NAME}.");
     eprintln!("Check it with: systemctl status {SERVICE_NAME}");
+    Ok(())
+}
+
+/// Copies the invoking user's settings to the system-wide location, since that
+/// is where the service reads the notification thresholds it acts on.
+fn seed_system_config() -> Result<()> {
+    let path = config::seed_system_config()?;
+    let config = Config::load();
+    eprintln!("Copied settings to {}", path.display());
+    if config.notifications.enabled {
+        eprintln!(
+            "Temperature alerts are on: the service will notify logged-in desktops (CPU >= {:.0}C, GPU >= {:.0}C).",
+            config.notifications.cpu_temp, config.notifications.gpu_temp
+        );
+    } else {
+        eprintln!("Temperature alerts are off. Turn them on with:");
+        eprintln!("      gigabytectl config set notifications.enabled true");
+        eprintln!("      sudo systemctl restart {SERVICE_NAME}");
+    }
     Ok(())
 }
 
@@ -862,23 +949,26 @@ fn seed_system_profiles() -> Result<()> {
 fn service_unit(exe: &Path) -> String {
     format!(
         "[Unit]
-Description=gigabytectl power-profiles-daemon sync
+Description=gigabytectl power-profiles-daemon sync and temperature alerts
 Documentation=https://github.com/Code-Sapling/gigabytectl
-# Apply the mapped gigabytectl profile whenever the system power profile changes.
+# Apply the mapped gigabytectl profile whenever the system power profile changes,
+# and raise temperature alerts when notifications are enabled in the config.
 After=power-profiles-daemon.service
 Wants=power-profiles-daemon.service
 
 [Service]
 Type=simple
 # Adjust the path if you installed elsewhere (e.g. /usr/bin/gigabytectl).
-# This runs as root, so it reads profiles from /etc/gigabytectl/profiles.toml
+# This runs as root, so it reads profiles and settings from /etc/gigabytectl
 # (not any user's ~/.config). `gigabytectl install-service` sets this up for you.
 ExecStart={} sync
 Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=power-profiles-daemon.service
+# multi-user.target so temperature alerts still run on machines without
+# power-profiles-daemon; the PPD unit so sync starts with it when it is there.
+WantedBy=multi-user.target power-profiles-daemon.service
 ",
         exe.display()
     )
@@ -902,6 +992,14 @@ mod tests {
         assert!(!Commands::Doctor.needs_hardware());
         assert!(!Commands::Completions { shell: Shell::Bash }.needs_hardware());
         assert!(!Commands::InstallService.needs_hardware());
+        // `self` manages the install itself, and must work on a machine whose
+        // driver is missing — that is a reason to uninstall, not a blocker.
+        assert!(
+            !Commands::Manage {
+                action: ManageAction::Uninstall { yes: false, dry_run: true, keep_config: false }
+            }
+            .needs_hardware()
+        );
     }
 
     #[test]

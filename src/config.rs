@@ -21,6 +21,9 @@ const PROFILES_FILE: &str = "profiles.toml";
 const CONFIG_FILE: &str = "config.toml";
 /// The TUI redraws between refreshes, so very small intervals only add load.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+/// Temperatures move slowly, and the sync service polls them for the whole
+/// uptime of the machine, so there is a floor on how often it may sample.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +75,9 @@ pub struct Notifications {
     pub gpu_temp: f32,
     /// Minimum gap between alerts for the same sensor.
     pub cooldown_secs: u64,
+    /// How often the sync service samples temperatures. Only used there: the
+    /// TUI and `monitor` alert on the samples they already take.
+    pub poll_interval_secs: u64,
 }
 
 impl Default for Notifications {
@@ -81,7 +87,16 @@ impl Default for Notifications {
             cpu_temp: 90.0,
             gpu_temp: 90.0,
             cooldown_secs: 300,
+            poll_interval_secs: 10,
         }
+    }
+}
+
+impl Notifications {
+    /// How often the sync service reads the sensors, floored so a mistyped
+    /// value cannot turn the service into a busy loop.
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.poll_interval_secs).max(MIN_POLL_INTERVAL)
     }
 }
 
@@ -111,7 +126,7 @@ impl Default for Config {
 
 impl Config {
     /// Every key `config get`/`config set` understands.
-    pub const KEYS: [&'static str; 7] = [
+    pub const KEYS: [&'static str; 8] = [
         "refresh_interval_ms",
         "units",
         "history_length",
@@ -119,6 +134,7 @@ impl Config {
         "notifications.cpu_temp",
         "notifications.gpu_temp",
         "notifications.cooldown_secs",
+        "notifications.poll_interval_secs",
     ];
 
     /// Loads the config from the user's directory, falling back to the
@@ -154,6 +170,7 @@ impl Config {
             "notifications.cpu_temp" => self.notifications.cpu_temp.to_string(),
             "notifications.gpu_temp" => self.notifications.gpu_temp.to_string(),
             "notifications.cooldown_secs" => self.notifications.cooldown_secs.to_string(),
+            "notifications.poll_interval_secs" => self.notifications.poll_interval_secs.to_string(),
             other => bail!("Unknown config key '{other}' (known keys: {})", Self::KEYS.join(", ")),
         })
     }
@@ -181,6 +198,7 @@ impl Config {
             "notifications.cpu_temp" => self.notifications.cpu_temp = parse_value(key, value)?,
             "notifications.gpu_temp" => self.notifications.gpu_temp = parse_value(key, value)?,
             "notifications.cooldown_secs" => self.notifications.cooldown_secs = parse_value(key, value)?,
+            "notifications.poll_interval_secs" => self.notifications.poll_interval_secs = parse_value(key, value)?,
             other => bail!("Unknown config key '{other}' (known keys: {})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -218,10 +236,42 @@ pub fn save_config(config: &Config, system: bool) -> Result<PathBuf> {
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(CONFIG_FILE);
     let text = toml::to_string_pretty(config).context("serializing config")?;
-    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
     if !system {
         system::chown_to_sudo_user(&dir);
+        // Settings the sync service acts on (notifications) live in the same
+        // file, so keep the copy it reads in step with the user's.
+        if let Err(e) = sync_config_to_system(&text) {
+            eprintln!("Warning: could not update {}: {e:#}", config_path(true).display());
+        }
     }
+    Ok(path)
+}
+
+/// Mirrors the user's config into the system-wide copy the root-run sync
+/// service reads. Only updates a copy that already exists, since creating one
+/// implies installing system state — that is `install-service`'s job. Returns
+/// whether it wrote.
+pub fn sync_config_to_system(text: &str) -> Result<bool> {
+    let path = config_path(true);
+    if !path.exists() || config_dir() == Path::new(SYSTEM_CONFIG_DIR) {
+        return Ok(false);
+    }
+    // Without root this is expected to fail; say so rather than looking broken.
+    ensure!(system::is_root(), "{} needs root to update (re-run with sudo)", path.display());
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Copies the current user config over the system-wide copy, creating it if
+/// need be, so the sync service sees the same settings. Used by
+/// `install-service`.
+pub fn seed_system_config() -> Result<PathBuf> {
+    let dir = Path::new(SYSTEM_CONFIG_DIR);
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let text = toml::to_string_pretty(&Config::load()).context("serializing config")?;
+    let path = config_path(true);
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
@@ -453,6 +503,29 @@ mod tests {
         assert_eq!(cfg.refresh_interval(), MIN_REFRESH_INTERVAL);
         let cfg = Config { refresh_interval_ms: 2000, ..Config::default() };
         assert_eq!(cfg.refresh_interval(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn every_documented_key_round_trips_through_get_and_set() {
+        let mut config = Config::default();
+        for key in Config::KEYS {
+            let value = config.get(key).expect("a documented key must be readable");
+            config
+                .set(key, &value)
+                .expect("what get prints must be what set accepts");
+            assert_eq!(config.get(key).unwrap(), value, "{key} changed on a round trip");
+        }
+        assert_eq!(config, Config::default());
+        assert!(config.get("notifications.nope").is_err());
+        assert!(config.set("notifications.nope", "1").is_err());
+    }
+
+    #[test]
+    fn the_service_poll_interval_has_a_floor() {
+        let notifications = Notifications { poll_interval_secs: 0, ..Notifications::default() };
+        assert_eq!(notifications.poll_interval(), MIN_POLL_INTERVAL);
+        let notifications = Notifications { poll_interval_secs: 30, ..Notifications::default() };
+        assert_eq!(notifications.poll_interval(), Duration::from_secs(30));
     }
 
     #[test]
