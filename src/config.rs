@@ -19,6 +19,7 @@ pub const SYSTEM_CONFIG_DIR: &str = "/etc/gigabytectl";
 
 const PROFILES_FILE: &str = "profiles.toml";
 const CONFIG_FILE: &str = "config.toml";
+const UPDATE_CHECK_FILE: &str = "update-check.json";
 /// The TUI redraws between refreshes, so very small intervals only add load.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 /// Temperatures move slowly, and the sync service polls them for the whole
@@ -109,6 +110,8 @@ pub struct Config {
     pub units: Units,
     /// Number of samples kept in the TUI history graph.
     pub history_length: usize,
+    /// Whether the TUI checks GitHub for a newer release in the background.
+    pub update_check: bool,
     /// Temperature alerts (disabled by default).
     pub notifications: Notifications,
 }
@@ -119,6 +122,7 @@ impl Default for Config {
             refresh_interval_ms: 1000,
             units: Units::Celsius,
             history_length: 120,
+            update_check: true,
             notifications: Notifications::default(),
         }
     }
@@ -126,10 +130,11 @@ impl Default for Config {
 
 impl Config {
     /// Every key `config get`/`config set` understands.
-    pub const KEYS: [&'static str; 8] = [
+    pub const KEYS: [&'static str; 9] = [
         "refresh_interval_ms",
         "units",
         "history_length",
+        "update_check",
         "notifications.enabled",
         "notifications.cpu_temp",
         "notifications.gpu_temp",
@@ -166,6 +171,7 @@ impl Config {
                 Units::Fahrenheit => "fahrenheit".to_string(),
             },
             "history_length" => self.history_length.to_string(),
+            "update_check" => self.update_check.to_string(),
             "notifications.enabled" => self.notifications.enabled.to_string(),
             "notifications.cpu_temp" => self.notifications.cpu_temp.to_string(),
             "notifications.gpu_temp" => self.notifications.gpu_temp.to_string(),
@@ -188,13 +194,8 @@ impl Config {
                 }
             }
             "history_length" => self.history_length = parse_value(key, value)?,
-            "notifications.enabled" => {
-                self.notifications.enabled = match value.to_ascii_lowercase().as_str() {
-                    "true" | "yes" | "on" | "1" => true,
-                    "false" | "no" | "off" | "0" => false,
-                    other => bail!("{key} must be true or false, got '{other}'"),
-                }
-            }
+            "update_check" => self.update_check = parse_bool(key, value)?,
+            "notifications.enabled" => self.notifications.enabled = parse_bool(key, value)?,
             "notifications.cpu_temp" => self.notifications.cpu_temp = parse_value(key, value)?,
             "notifications.gpu_temp" => self.notifications.gpu_temp = parse_value(key, value)?,
             "notifications.cooldown_secs" => self.notifications.cooldown_secs = parse_value(key, value)?,
@@ -209,6 +210,14 @@ fn parse_value<T: std::str::FromStr>(key: &str, value: &str) -> Result<T> {
     value
         .parse()
         .map_err(|_| anyhow!("'{value}' is not a valid value for {key}"))
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => true,
+        "false" | "no" | "off" | "0" => false,
+        other => bail!("{key} must be true or false, got '{other}'"),
+    })
 }
 
 /// Loads one specific config file, falling back to defaults when it is missing
@@ -384,7 +393,24 @@ fn saved_name(table: &[&'static str], value: Option<i32>) -> Option<String> {
 /// Prefers the invoking user's home (via `$SUDO_USER`) so config lives in the
 /// real user's `~/.config`, not root's.
 pub fn config_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+    xdg_dir("XDG_CONFIG_HOME", ".config")
+}
+
+/// Where cached state that is not configuration lives — currently only the
+/// result of the update check. Resolved like [`config_dir`], so the TUI running
+/// under `sudo` caches in the invoking user's home rather than root's.
+pub fn cache_dir() -> PathBuf {
+    xdg_dir("XDG_CACHE_HOME", ".cache")
+}
+
+pub fn cache_path() -> PathBuf {
+    cache_dir().join(UPDATE_CHECK_FILE)
+}
+
+/// Our directory under an XDG base directory, honouring the environment
+/// variable and falling back to `$HOME/<fallback>`.
+fn xdg_dir(variable: &str, fallback: &str) -> PathBuf {
+    if let Ok(xdg) = std::env::var(variable)
         && !xdg.is_empty()
     {
         return PathBuf::from(xdg).join("gigabytectl");
@@ -393,7 +419,7 @@ pub fn config_dir() -> PathBuf {
         .and_then(|user| system::home_of_user(&user))
         .or_else(|| std::env::var("HOME").ok())
         .unwrap_or_else(|| "/root".to_string());
-    PathBuf::from(home).join(".config").join("gigabytectl")
+    PathBuf::from(home).join(fallback).join("gigabytectl")
 }
 
 /// Path profiles are written to.

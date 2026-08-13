@@ -1,6 +1,6 @@
 //! State and input handling for the interactive TUI.
 
-use std::{ops::RangeInclusive, time::Instant};
+use std::{ops::RangeInclusive, sync::mpsc::Receiver, time::Instant};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,6 +9,7 @@ use crate::{
     config::{self, Config, Profile},
     history::History,
     notify::Notifier,
+    selfcmd,
     sensors::{Fan, Sensors, Temps},
     sysfs::{self, HwState},
 };
@@ -187,13 +188,18 @@ pub struct App {
     pub history: History,
     pub config: Config,
     pub last_refresh: Instant,
+    /// Version of a newer release, once the background check has found one.
+    pub update: Option<String>,
 
     sensors: Sensors,
     notifier: Notifier,
+    /// Delivers the result of the background release check, at most once.
+    update_check: Receiver<String>,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let update_check = selfcmd::spawn_update_check(config.update_check);
         let mut app = Self {
             selected: 0,
             focus: Focus::Normal,
@@ -211,8 +217,10 @@ impl App {
             temps: Temps::default(),
             history: History::new(config.history_length),
             last_refresh: Instant::now(),
+            update: None,
             sensors: Sensors::new(),
             notifier: Notifier::new(&config.notifications),
+            update_check,
             config,
         };
         app.reload_profiles();
@@ -323,10 +331,20 @@ impl App {
         self.temps = self.sensors.read_temps();
         self.history.push(self.temps, &self.fans);
         self.notifier.check(self.temps);
+        self.poll_update_check();
         if self.shows_fan_curve() {
             self.reload_fan_curve();
         }
         self.last_refresh = Instant::now();
+    }
+
+    /// Picks up the background release check without ever waiting on it.
+    fn poll_update_check(&mut self) {
+        if self.update.is_none()
+            && let Ok(version) = self.update_check.try_recv()
+        {
+            self.update = Some(version);
+        }
     }
 
     fn shows_fan_curve(&self) -> bool {

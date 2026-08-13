@@ -1,11 +1,6 @@
 //! Command-line interface: argument definitions and one-shot commands.
 
-use std::{
-    fs, io,
-    path::Path,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fs, io, path::Path, thread, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -669,7 +664,7 @@ fn csv_header(channels: &[u32]) -> String {
 fn csv_row(channels: &[u32], temps: Temps, fans: &[Fan], units: Units) -> String {
     let number = |value: Option<f64>| value.map_or(String::new(), |v| format!("{v:.1}"));
     let mut columns = vec![
-        unix_timestamp().to_string(),
+        system::unix_time().to_string(),
         number(units.to_json(temps.cpu)),
         number(units.to_json(temps.gpu)),
     ];
@@ -679,12 +674,6 @@ fn csv_row(channels: &[u32], temps: Temps, fans: &[Fan], units: Units) -> String
         columns.push(fan.and_then(|fan| fan.pwm).map_or(String::new(), |pwm| pwm.to_string()));
     }
     columns.join(",")
-}
-
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
 }
 
 fn run_profile(args: &ProfileArgs) -> Result<()> {

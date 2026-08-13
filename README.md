@@ -20,6 +20,7 @@ See More:
 - `doctor` reports what the driver exposes on your specific model
 - Optional temperature notifications (off by default), raised by the background service so nothing has to stay open
 - `self update` / `self uninstall` to manage the installation from the tool itself
+- Tells you in the corner of the TUI when a newer release is out
 - Scriptable headless/CLI mode for automation, including a `monitor` mode
 - Shell completions for bash, zsh, and fish
 - Configurable defaults (refresh interval, temperature units)
@@ -190,6 +191,7 @@ Optional defaults live in `~/.config/gigabytectl/config.toml`. Missing or invali
 refresh_interval_ms = 1000   # TUI auto-refresh and default monitor interval
 units = "celsius"            # celsius|fahrenheit (temperature display)
 history_length = 120         # samples kept in the TUI history graph
+update_check = true          # check GitHub for a newer release and show it in the TUI
 
 [notifications]              # desktop alerts, off unless you turn them on
 enabled = false
@@ -314,7 +316,7 @@ sudo gigabytectl self uninstall --dry-run   # list exactly what would go
 sudo gigabytectl self uninstall             # asks for confirmation first
 ```
 
-This disables and removes the systemd service, deletes `/etc/gigabytectl` and every user's `~/.config/gigabytectl`, removes the shell completions installed at the documented paths, and finally removes the binary itself. Options:
+This disables and removes the systemd service, deletes `/etc/gigabytectl` and every user's `~/.config/gigabytectl` and `~/.cache/gigabytectl`, removes the shell completions installed at the documented paths, and finally removes the binary itself. Options:
 
 - `--dry-run` — print the list and stop, changing nothing (works without root)
 - `--yes` / `-y` — skip the confirmation prompt (required when not on a terminal)
@@ -323,6 +325,22 @@ This disables and removes the systemd service, deletes `/etc/gigabytectl` and ev
 > If the binary belongs to a distro package (`pacman`, `dpkg`), it is left in place and named in the output — remove it with your package manager. For a `cargo install`, run `cargo uninstall gigabytectl` afterwards to tidy its metadata.
 
 ## ↻ Update
+
+The TUI tells you when a release is out, with a badge in the top-right corner and the command to run in the footer:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ gigabytectl   Gigabyte control panel    root   last refresh: 0s ago  ↑ update 0.5.0 → 0.6.0 │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The check runs in a background thread, so it never delays or blocks the interface, and the answer is cached in `~/.cache/gigabytectl/update-check.json` for a day — GitHub is not contacted on every launch. If it fails (offline, no `curl`, rate-limited) nothing is shown. To turn it off entirely:
+
+```bash
+gigabytectl config set update_check false
+```
+
+Then update whenever you like:
 
 ```bash
 gigabytectl self update --check     # just report whether a newer release exists

@@ -8,15 +8,17 @@ use std::{
     io::{self, IsTerminal, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+    thread,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{SERVICE_NAME, SERVICE_PATH},
     config,
-    system::{self, checked_status, checked_stdout, command_stdout},
+    system::{self, checked_status, checked_stdout, command_stdout, unix_time},
 };
 
 const RELEASES_API: &str = "https://api.github.com/repos/Code-Sapling/gigabytectl/releases/latest";
@@ -26,6 +28,9 @@ const DATA_DIR_NAME: &str = "gigabytectl";
 /// Long enough for a slow connection, short enough that a hung server does not
 /// wedge the command forever.
 const DOWNLOAD_TIMEOUT_SECS: &str = "300";
+/// How long the background check trusts its last answer. Releases are rare, and
+/// the TUI would otherwise ask GitHub on every launch.
+const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
 
 // --- self update ---
 
@@ -52,8 +57,11 @@ pub fn update(check: bool, dry_run: bool) -> Result<()> {
     println!("Installed: {current} ({})", exe.display());
 
     let release = latest_release()?;
-    let latest = release.tag_name.trim_start_matches('v').to_string();
+    let latest = release_version(&release);
     println!("Latest:    {latest} (tag {})", release.tag_name);
+    // A check made here is as good as one made in the background, and after an
+    // update it is what stops the TUI badge lingering until the cache expires.
+    write_cache(&latest);
 
     if !is_newer(&latest, current) {
         println!("\nAlready up to date.");
@@ -93,6 +101,79 @@ pub fn update(check: bool, dry_run: bool) -> Result<()> {
     restart_service_if_running(&exe);
     println!("Note: regenerate your shell completions (gigabytectl completions <shell>).");
     Ok(())
+}
+
+// --- background check (the TUI's update badge) ---
+
+/// The last answer from GitHub, so launching the TUI is not a network round
+/// trip every time.
+#[derive(Serialize, Deserialize)]
+struct CheckCache {
+    /// Unix time the check ran.
+    checked_at: u64,
+    /// Version of the latest release, without the leading `v`.
+    latest: String,
+}
+
+/// Starts a check for a newer release in the background, handing back the
+/// receiver the TUI polls. Sends at most one version, and only when it is newer
+/// than this build.
+///
+/// Nothing here can hold up or interrupt the UI: the caller never blocks, and a
+/// failed check (offline, no curl, rate-limited) is simply silent.
+pub fn spawn_update_check(enabled: bool) -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    // Test builds must never reach the network.
+    if enabled && !cfg!(test) {
+        thread::spawn(move || {
+            if let Some(version) = newer_release() {
+                let _ = sender.send(version);
+            }
+        });
+    }
+    receiver
+}
+
+/// The latest released version, if it is newer than what is running.
+fn newer_release() -> Option<String> {
+    let latest = match fresh_cache() {
+        Some(cache) => cache.latest,
+        None => {
+            let latest = release_version(&latest_release().ok()?);
+            write_cache(&latest);
+            latest
+        }
+    };
+    is_newer(&latest, env!("CARGO_PKG_VERSION")).then_some(latest)
+}
+
+/// The cached answer, while it is still within its lifetime.
+fn fresh_cache() -> Option<CheckCache> {
+    let text = fs::read_to_string(config::cache_path()).ok()?;
+    let cache: CheckCache = serde_json::from_str(&text).ok()?;
+    // A clock that has moved backwards makes the age meaningless, so it just
+    // counts as stale rather than as fresh forever.
+    (unix_time().saturating_sub(cache.checked_at) < CHECK_TTL_SECS).then_some(cache)
+}
+
+/// Records the answer for next time. Best-effort: a cache that cannot be
+/// written only means the next check goes to the network.
+fn write_cache(latest: &str) {
+    let path = config::cache_path();
+    let Some(dir) = path.parent() else { return };
+    let cache = CheckCache { checked_at: unix_time(), latest: latest.to_string() };
+    let Ok(text) = serde_json::to_string(&cache) else {
+        return;
+    };
+    if fs::create_dir_all(dir).is_ok() && fs::write(&path, text).is_ok() {
+        // The TUI runs as root; leave the cache owned by the user whose home it
+        // was written into.
+        system::chown_to_sudo_user(dir);
+    }
+}
+
+fn release_version(release: &Release) -> String {
+    release.tag_name.trim_start_matches('v').to_string()
 }
 
 fn latest_release() -> Result<Release> {
@@ -315,9 +396,14 @@ fn remove_service() {
 /// invoking user's, and any other user's, since the tool is normally used
 /// through `sudo` and can leave state in more than one home.
 fn data_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from(config::SYSTEM_CONFIG_DIR), config::config_dir()];
+    let mut dirs = vec![
+        PathBuf::from(config::SYSTEM_CONFIG_DIR),
+        config::config_dir(),
+        config::cache_dir(),
+    ];
     for home in home_dirs() {
         dirs.push(home.join(".config").join(DATA_DIR_NAME));
+        dirs.push(home.join(".cache").join(DATA_DIR_NAME));
     }
     dirs.retain(|dir| dir.is_dir());
     dirs.sort();

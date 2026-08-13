@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
@@ -62,7 +62,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let [controls_area, status_area] = Layout::vertical([Constraint::Min(10), Constraint::Length(4)]).areas(left);
     let [detail_area, help_area] = Layout::vertical([Constraint::Min(12), Constraint::Length(5)]).areas(right);
 
-    frame.render_widget(header(app), header_area);
+    let header_line = header(app);
+    let header_width = header_line.width() as u16;
+    frame.render_widget(
+        Paragraph::new(header_line).block(Block::bordered().style(Style::new().fg(theme::ACCENT))),
+        header_area,
+    );
+    if let Some(version) = &app.update {
+        update_badge(frame, header_area, header_width, version);
+    }
     controls(frame, controls_area, app);
     frame.render_widget(status(app), status_area);
     detail(frame, detail_area, app);
@@ -92,9 +100,9 @@ fn confirm_popup(frame: &mut Frame, area: Rect, message: &str) {
     );
 }
 
-fn header(app: &App) -> Paragraph<'static> {
+fn header(app: &App) -> Line<'static> {
     const TAG: Modifier = Modifier::BOLD;
-    Paragraph::new(Line::from(vec![
+    Line::from(vec![
         Span::styled(
             " gigabytectl ",
             Style::new().fg(Color::Black).bg(theme::ACCENT).add_modifier(TAG),
@@ -105,8 +113,30 @@ fn header(app: &App) -> Paragraph<'static> {
         Span::styled(" root ", Style::new().fg(Color::Black).bg(Color::Green).add_modifier(TAG)),
         Span::raw("  "),
         Span::raw(format!("last refresh: {}s ago", app.last_refresh.elapsed().as_secs())),
-    ]))
-    .block(Block::bordered().style(Style::new().fg(theme::ACCENT)))
+    ])
+}
+
+/// Draws the "update available" badge in the top-right of the header.
+///
+/// It covers only its own width, so it cannot blank the header text, and it is
+/// dropped entirely when the terminal is too narrow to hold both — losing a
+/// notice is better than painting over the reading the user came for.
+fn update_badge(frame: &mut Frame, header_area: Rect, header_width: u16, version: &str) {
+    let badge = Span::styled(
+        format!(" ↑ update {} → {version} ", env!("CARGO_PKG_VERSION")),
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    let inner = header_area.inner(Margin::new(1, 1));
+    let width = badge.width() as u16;
+    // Two spaces of clearance, so it never abuts the "last refresh" text.
+    if inner.width < header_width + width + 2 {
+        return;
+    }
+    let area = Rect { x: inner.x + inner.width - width, width, height: 1, ..inner };
+    frame.render_widget(Paragraph::new(badge), area);
 }
 
 fn controls(frame: &mut Frame, area: Rect, app: &App) {
@@ -128,10 +158,12 @@ fn status(app: &App) -> Paragraph<'static> {
 }
 
 fn footer(app: &App) -> Paragraph<'static> {
-    let text = if app.focus == Focus::Editing {
-        "Editing mode: type numbers only, then press Enter"
-    } else {
-        "Ready"
+    // The badge says a release exists; the footer has the room to say what to
+    // do about it.
+    let text = match (app.focus, &app.update) {
+        (Focus::Editing, _) => "Editing mode: type numbers only, then press Enter".to_string(),
+        (_, Some(version)) => format!("gigabytectl {version} is available - run: sudo gigabytectl self update"),
+        _ => "Ready".to_string(),
     };
     Paragraph::new(text).block(Block::bordered().style(theme::MUTED))
 }
@@ -522,6 +554,40 @@ mod tests {
         assert!(tiny.height <= 6 && tiny.width <= 20);
     }
 
+    /// The rendered contents of one row, for asserting on what a draw produced.
+    fn row_text(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_update_badge_sits_in_the_corner_without_covering_the_header() {
+        let mut app = App::new(Config::default());
+        app.update = Some("9.9.9".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let header = row_text(&terminal, 1);
+        assert!(header.contains("gigabytectl"), "{header}");
+        assert!(header.contains("last refresh"), "the badge must not paint over the header text");
+        assert!(header.contains("→ 9.9.9"), "{header}");
+        assert!(
+            header.find("↑ update").is_some_and(|column| column > 80),
+            "the badge belongs in the right-hand corner: {header}"
+        );
+        assert!(
+            row_text(&terminal, 38).contains("self update"),
+            "the footer says what to do about it"
+        );
+
+        // Too narrow to hold both: the header text wins, the badge is dropped.
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let header = row_text(&terminal, 1);
+        assert!(header.contains("Gigabyte control panel"), "{header}");
+        assert!(!header.contains("9.9.9"), "{header}");
+    }
+
     /// Rendering must not panic on tiny terminals or with no data yet.
     #[test]
     fn every_view_renders_at_several_sizes() {
@@ -529,6 +595,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut app = App::new(Config::default());
             app.fan_curve = Some(vec![(30, 40); sysfs::FAN_CURVE_POINTS]);
+            app.update = Some("9.9.9".to_string());
             for index in 0..Item::ALL.len() {
                 app.selected = index;
                 terminal.draw(|frame| draw(frame, &app)).unwrap();

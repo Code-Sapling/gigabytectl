@@ -1,8 +1,20 @@
 //! Process-level helpers: privilege checks and running external commands.
 
-use std::{os::unix::fs::MetadataExt, path::Path, process::Command};
+use std::{
+    os::unix::fs::MetadataExt,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, ensure};
+
+/// Seconds since the Unix epoch, or `0` on a clock set before it.
+pub fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
 
 /// True when the process is running as root.
 pub fn is_root() -> bool {
