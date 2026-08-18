@@ -3,7 +3,11 @@ Description=gigabytectl power-profiles-daemon sync and temperature alerts
 Documentation=https://github.com/Code-Sapling/gigabytectl
 # Apply the mapped gigabytectl profile whenever the system power profile changes,
 # and raise temperature alerts when notifications are enabled in the config.
-After=power-profiles-daemon.service
+#
+# Deliberately not ordered After=power-profiles-daemon.service: PPD's own unit is
+# After=multi-user.target and this one is WantedBy=multi-user.target, so that
+# ordering closes a cycle and systemd silently drops this unit's start job at
+# boot. `gigabytectl sync` waits for PPD on the bus instead.
 Wants=power-profiles-daemon.service
 
 [Service]

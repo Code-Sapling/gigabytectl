@@ -8,6 +8,8 @@ use std::{
     io::{BufRead, BufReader},
     process::{Command, Stdio},
     sync::OnceLock,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -27,22 +29,51 @@ const ENDPOINTS: [(&str, &str); 2] = [
 
 const PROPERTY: &str = "ActiveProfile";
 
-/// Probing costs a `busctl` round trip, and the answer cannot change while the
-/// process runs, so it is resolved at most once.
-static ENDPOINT: OnceLock<Option<(&'static str, &'static str)>> = OnceLock::new();
+/// Probing costs a `busctl` round trip, so a hit is remembered for the life of
+/// the process. A miss deliberately is not: the sync service can start before
+/// power-profiles-daemon has taken its bus name, and caching that miss would
+/// strand the daemon believing PPD is absent for as long as it runs.
+static ENDPOINT: OnceLock<(&'static str, &'static str)> = OnceLock::new();
+
+/// How long [`wait_until_available`] gives power-profiles-daemon to appear, and
+/// how often it re-probes while waiting.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const WAIT_POLL: Duration = Duration::from_millis(500);
 
 /// The first endpoint whose `ActiveProfile` can be read, or `None` when
 /// power-profiles-daemon is not reachable on the system bus.
 fn endpoint() -> Option<(&'static str, &'static str)> {
-    *ENDPOINT.get_or_init(|| {
-        ENDPOINTS
-            .into_iter()
-            .find(|&(dest, path)| command_stdout("busctl", &get_property_args(dest, path)).is_some())
-    })
+    if let Some(&found) = ENDPOINT.get() {
+        return Some(found);
+    }
+    let found = ENDPOINTS
+        .into_iter()
+        .find(|&(dest, path)| command_stdout("busctl", &get_property_args(dest, path)).is_some())?;
+    Some(*ENDPOINT.get_or_init(|| found))
 }
 
 pub fn is_available() -> bool {
     endpoint().is_some()
+}
+
+/// Waits for power-profiles-daemon to appear on the system bus, returning
+/// whether it did.
+///
+/// The sync unit is not ordered `After=power-profiles-daemon.service` — that
+/// ordering forms a boot-time cycle (see the unit's own comment) — so at boot
+/// the two race. Polling here absorbs the race without the ordering, and costs
+/// nothing when PPD is already up or genuinely not installed beyond the wait.
+pub fn wait_until_available() -> bool {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if is_available() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(WAIT_POLL);
+    }
 }
 
 fn get_property_args<'a>(dest: &'a str, path: &'a str) -> [&'a str; 6] {

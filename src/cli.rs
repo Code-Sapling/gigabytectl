@@ -799,14 +799,19 @@ fn run_config(args: &ConfigArgs) -> Result<()> {
 fn run_sync(once: bool, config: &Config) -> Result<()> {
     require_hardware()?;
     let notifications = &config.notifications;
-    let ppd_available = ppd::is_available();
     const NO_PPD: &str = "power-profiles-daemon is not available on the system bus (is it installed and running?)";
 
     if once {
-        // Apply whatever profile is active right now, then stop.
-        ensure!(ppd_available, "{NO_PPD}");
+        // Apply whatever profile is active right now, then stop. Run by hand, so
+        // it reports a missing PPD immediately rather than waiting one out.
+        ensure!(ppd::is_available(), "{NO_PPD}");
         return apply_mapped_profile(&ppd::get()?);
     }
+
+    // As a service this can start before power-profiles-daemon owns its bus name
+    // (the unit is deliberately not ordered after it -- that ordering cycles at
+    // boot), so give PPD a chance to appear before concluding it is absent.
+    let ppd_available = ppd::wait_until_available();
 
     // Alerts alone are a legitimate reason to run this service, so PPD is only
     // required when there would otherwise be nothing to do.
@@ -942,7 +947,11 @@ Description=gigabytectl power-profiles-daemon sync and temperature alerts
 Documentation=https://github.com/Code-Sapling/gigabytectl
 # Apply the mapped gigabytectl profile whenever the system power profile changes,
 # and raise temperature alerts when notifications are enabled in the config.
-After=power-profiles-daemon.service
+#
+# Deliberately not ordered After=power-profiles-daemon.service: PPD's own unit is
+# After=multi-user.target and this one is WantedBy=multi-user.target, so that
+# ordering closes a cycle and systemd silently drops this unit's start job at
+# boot. `gigabytectl sync` waits for PPD on the bus instead.
 Wants=power-profiles-daemon.service
 
 [Service]
